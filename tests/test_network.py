@@ -486,3 +486,147 @@ def test_normal_passive_flush_keeps_its_verdict_fairness_budget():
     assert worker._observations.qsize() == 188
     worker._flush_passive(force=True)
     assert len(worker.runtime.records) == 700
+
+
+class ReceivedWireFrame:
+    sniffed_on = "eth0"
+
+    def __init__(self, raw):
+        self.layer = SimpleNamespace(original=raw)
+
+    def getlayer(self, name):
+        return self.layer if name == "IP" else None
+
+
+def test_real_config_defaults_to_readonly_and_never_installs_nfqueue(tmp_path):
+    import time
+    from requestwatch.config import Config
+
+    calls = []
+
+    def forbidden(*args, **kwargs):
+        calls.append(args)
+        raise AssertionError("Read-only capture must not load NFQUEUE or modify iptables")
+
+    class Sniffer:
+        def __init__(self, **kwargs):
+            self.running = False
+
+        def start(self):
+            self.running = True
+
+        def stop(self):
+            self.running = False
+
+    config = Config(data_dir=tmp_path, token="readonly-capture-test-token")
+    config.prepare()
+    assert config.passive_only is True
+    runtime = FakeRuntime(intercept=True)  # Even existing enabled packet rules cannot activate queueing.
+    worker = NetworkEngine(runtime, config, runner=forbidden, queue_factory=forbidden,
+                           sniffer_factory=Sniffer, interface_provider=lambda: ["eth0"], platform_name="linux")
+    try:
+        worker.start()
+        assert worker._rules_need_queue() is False
+        worker._enable_queue()
+        worker._on_sniff(ReceivedWireFrame(make_packet(b"read-only-full-payload")))
+        until = time.monotonic() + 2
+        while not runtime.records and time.monotonic() < until:
+            time.sleep(0.005)
+        assert len(runtime.records) == 1
+        record = next(iter(runtime.records.values()))
+        assert record["payload_text"] == "read-only-full-payload" and record["state"] == "captured"
+        queued = FakePacket(make_packet())
+        worker._on_queued(queued)
+        assert queued.verdicts == ["accept"] and not queued.retained
+        assert len(runtime.records) == 1 and calls == []
+        assert worker.status()["capture_mode"] == "passive" and not worker.status()["interception_running"]
+    finally:
+        worker.stop()
+    assert calls == []
+
+
+def test_passive_callback_keeps_original_bytes_and_worker_batches_without_nfqueue_delay(monkeypatch):
+    class BatchedRuntime(FakeRuntime):
+        def __init__(self):
+            super().__init__(intercept=False)
+            self.batches = []
+
+        def ingest_packets(self, records):
+            self.batches.append(len(records))
+            for record in records:
+                self.ingest(record, can_intercept=False)
+
+    runtime = BatchedRuntime()
+    worker = engine(runtime)
+    worker.config.passive_only = True
+    raw = make_packet(b"complete-payload" * 200)
+    frame = ReceivedWireFrame(raw)  # Layer has no __bytes__: use received bytes directly.
+    for _ in range(700):
+        worker._on_sniff(frame)
+    assert runtime.records == {} and worker._observations.qsize() == 700
+
+    def no_hash(*args, **kwargs):
+        raise AssertionError("Pure passive capture must not compute NFQUEUE fingerprints")
+
+    monkeypatch.setattr("requestwatch.network.hashlib.blake2s", no_hash)
+    assert worker._flush_passive() == 512  # Newly captured packets do not wait 120ms.
+    assert runtime.batches == [512]
+    worker._flush_passive(force=True)
+    assert runtime.batches == [512, 188]
+    assert len(runtime.records) == 700
+    assert all(record["payload_hex"] == parse_packet(raw).payload.hex() for record in runtime.records.values())
+
+
+def test_observation_overflow_counter_does_not_mean_original_packet_drop():
+    import queue
+
+    worker = engine(FakeRuntime(intercept=False))
+    worker.config.passive_only = True
+    worker._observations = queue.Queue(maxsize=1)
+    raw = make_packet(b"wire-copy")
+    frame = ReceivedWireFrame(raw)
+    worker._on_sniff(frame)
+    worker._on_sniff(frame)
+    assert frame.layer.original == raw
+    status = worker.status()
+    assert status["passive_dropped"] == status["observation_dropped"] == 1
+    assert status["observation_backlog"] == 1
+    assert status["observation_drop_semantics"] == "capture copies not saved; original network packets are unaffected"
+    assert not worker._pending and worker._nfqueue is None
+
+
+def test_failed_batch_retries_individual_records_instead_of_losing_whole_batch():
+    class FailingBatch(FakeRuntime):
+        def ingest_packets(self, records):
+            raise OSError("batch failed before commit")
+
+    runtime = FailingBatch(intercept=False)
+    worker = engine(runtime)
+    for _ in range(12):
+        worker._on_sniff(ReceivedWireFrame(make_packet()))
+    worker._flush_passive(force=True)
+    assert len(runtime.records) == 12
+    assert worker.status()["observation_write_failed"] == 0
+
+
+def test_large_passive_packets_use_bounded_byte_batches_without_truncation():
+    class BatchedRuntime(FakeRuntime):
+        def __init__(self):
+            super().__init__(intercept=False)
+            self.batches = []
+
+        def ingest_packets(self, records):
+            self.batches.append((len(records), sum(record["payload_size"] for record in records)))
+            for record in records:
+                self.ingest(record, can_intercept=False)
+
+    runtime = BatchedRuntime()
+    worker = engine(runtime)
+    payload = b"x" * 60000 + b"GSO-END"
+    raw = make_packet(payload)
+    for _ in range(150):
+        worker._on_sniff(ReceivedWireFrame(raw))
+    worker._flush_passive(force=True)
+    assert len(runtime.records) == 150 and len(runtime.batches) >= 3
+    assert all(size < 4 * 1024 * 1024 + len(raw) for _, size in runtime.batches)
+    assert all(record["payload_size"] == len(payload) and record["payload_text"].endswith("GSO-END") for record in runtime.records.values())

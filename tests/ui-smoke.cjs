@@ -5,6 +5,7 @@ const {chromium} = require(process.env.RW_PLAYWRIGHT_MODULE || 'playwright-core'
 (async () => {
   const browser = await chromium.launch({headless: true, ...(process.env.RW_BROWSER_PATH ? {executablePath: process.env.RW_BROWSER_PATH} : {})});
   const page = await browser.newPage({viewport: {width: 1440, height: 1050}, deviceScaleFactor: 1});
+  async function closeDrawer() { if (await page.locator('#record-detail-drawer').isVisible()) await page.locator('#close-detail').click(); }
   const errors = [];
   page.on('pageerror', e => errors.push(String(e)));
   const base = process.env.RW_UI_URL || 'http://127.0.0.1:7030';
@@ -32,6 +33,7 @@ const {chromium} = require(process.env.RW_PLAYWRIGHT_MODULE || 'playwright-core'
   await page.waitForFunction(() => document.querySelector('#detail-state').textContent.includes('已重发'));
   await page.locator('[data-tab="request"]').click();
   await page.waitForFunction(() => document.querySelector('#detail-body .full-body')?.textContent.includes('界面草稿保留验证'));
+  await closeDrawer();
   await page.locator('.navigation [data-view="rules"]').click();
   await page.locator('#new-rule').click();
   await page.locator('#rule-name').fill('UI 验证 · 待审请求');
@@ -49,6 +51,7 @@ const {chromium} = require(process.env.RW_PLAYWRIGHT_MODULE || 'playwright-core'
   await page.waitForFunction(() => document.querySelector('#detail-state').textContent.includes('已放行'));
   await page.locator('[data-tab="request"]').click();
   await page.waitForFunction(() => document.querySelector('#detail-body .full-body')?.textContent.includes('UI 已批准'));
+  await closeDrawer();
   await page.locator('.navigation [data-view="rules"]').click();
   await page.locator('#generate-demo-request').click();
   await page.locator('#pending-actions:not([hidden])').waitFor();
@@ -76,6 +79,7 @@ const {chromium} = require(process.env.RW_PLAYWRIGHT_MODULE || 'playwright-core'
     response_body_text: fullResponse, response_body_size: Buffer.byteLength(fullResponse), response_body_binary: false
   }});
   assert(responseSaved.ok(), await responseSaved.text());
+  await closeDrawer();
   await page.locator('.navigation [data-view="traffic"]').click();
   await page.locator('#reset-filters').click();
   await page.locator('#filter-query').fill(`${unique}-request-tail`);
@@ -126,6 +130,7 @@ const {chromium} = require(process.env.RW_PLAYWRIGHT_MODULE || 'playwright-core'
   const replayId = await page.locator('#detail-id').getAttribute('title');
   const replayBody = await page.request.get(`${base}/api/records/${replayId}/body/request?view=raw`, {headers: authHeaders});
   assert(replayBody.ok()); assert((await replayBody.body()).equals(Buffer.from(fullEdited)));
+  await closeDrawer();
   await page.locator('#filter-query').fill(`${unique}-response-tail`);
   await page.waitForFunction(id => Array.from(document.querySelectorAll('#records-body tr')).some(row => row.dataset.id === id), recordId);
 
@@ -140,6 +145,7 @@ const {chromium} = require(process.env.RW_PLAYWRIGHT_MODULE || 'playwright-core'
     const serverBody = await page.request.get(`${base}/api/sessions/${sessionId}/body/server?view=text`, {headers: authHeaders});
     const clientText = await clientBody.text(); const serverText = await serverBody.text();
     assert(clientText.length > 65536, 'TCP fixture must span many packets and HEX pages');
+    await closeDrawer();
     await page.locator('.navigation [data-view="sessions"]').click();
     await page.locator('#session-query').fill(process.env.RW_UI_SESSION_MARKER || clientText.slice(-24));
     await page.locator(`#sessions-body tr[data-id="${sessionId}"]`).waitFor();
@@ -177,11 +183,14 @@ const {chromium} = require(process.env.RW_PLAYWRIGHT_MODULE || 'playwright-core'
   }
 
 
+  await closeDrawer();
   await require('./ui-settings.cjs').runSettingsChecks(page, base, adminToken);
 
+  await closeDrawer();
   await page.locator('.navigation [data-view="containers"]').click();
   await page.locator('.container-card').first().waitFor();
   assert.equal(await page.locator('.container-card').count(), 2);
+  await closeDrawer();
   await page.locator('.navigation [data-view="traffic"]').click();
   await page.locator('#reset-filters').click();
   await page.locator('#records-body tr').first().waitFor();

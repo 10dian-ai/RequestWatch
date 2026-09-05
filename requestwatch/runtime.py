@@ -41,7 +41,7 @@ class Runtime:
                 logging.getLogger(__name__).exception("TCP session capture failed")
                 record["tcp_session_error"] = str(exc)
         with self._lock:
-            if can_intercept:
+            if can_intercept and not getattr(self.config, "passive_only", False):
                 rule = next((r for r in self._rules if matches(r, record, self.store.bodies)), None)
                 if rule and len(self._pending) < self.config.pending_limit:
                     seconds = rule["timeout_seconds"]
@@ -56,6 +56,37 @@ class Runtime:
                 # A failed persistence cannot leave an unpollable queue slot behind.
                 self._pending.pop(record["id"], None)
                 raise
+
+    def ingest_packets(self, records: list[dict]) -> list[dict]:
+        """Persist passive observations in a batch; never evaluate pause rules.
+
+        Interactive packet verdicts continue using ingest(can_intercept=True).
+        The capture worker falls back to individual observations if a batch fails,
+        retaining good raw packets even when one stream cannot be reconstructed.
+        """
+        if any(record.get("source") != "packet" or record.get("state") in {"pending", "resolving"} for record in records):
+            raise ValueError("Batch capture accepts only passive packet observations")
+        prepared, attribution = [], {}
+        for original in records:
+            record = dict(original)
+            if "id" not in record:
+                record["id"] = uuid.uuid4().hex
+            record.setdefault("created_at", time.time())
+            record.setdefault("state", "captured")
+            if self.inventory and not record.get("container_id") and record.get("attribution") != "host-replay":
+                key = (record.get("src_ip", ""), record.get("dst_ip", ""))
+                if key not in attribution:
+                    attribution[key] = self.inventory.identify(*key)
+                record.update(attribution[key])
+            prepared.append(record)
+        if self.streams:
+            tcp = [record for record in prepared if record.get("protocol") == "TCP"]
+            if tcp:
+                session_ids = self.streams.ingest_many(tcp)
+                for record, session_id in zip(tcp, session_ids):
+                    if session_id:
+                        record["tcp_session_id"] = session_id
+        return self.store.save_many(prepared)
 
     def update(self, record_id: str, changes: dict):
         with self._lock:

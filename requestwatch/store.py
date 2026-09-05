@@ -57,32 +57,53 @@ class Store:
                 self.db.execute("UPDATE records SET state='error',data=? WHERE id=?", (json.dumps(record, ensure_ascii=False), row["id"]))
 
     def save(self, record: dict) -> dict:
-        record = self.bodies.externalize(record)
-        record.setdefault("id", uuid.uuid4().hex)
-        record.setdefault("created_at", time.time())
-        record.setdefault("state", "captured")
-        record.setdefault("container_id", "")
-        with self.lock, self.db:
+        return self.save_many([record])[0]
+
+    def save_many(self, records: list[dict]) -> list[dict]:
+        """Persist a capture batch in one transaction, counting each new ID once.
+
+        Prepare complete records before entering SQLite so invalid input cannot
+        leave a partly committed batch. Retention and counters run once per batch.
+        """
+        prepared = []
+        for original in records:
+            record = self.bodies.externalize(original)
+            if "id" not in record:
+                record["id"] = uuid.uuid4().hex
+            record.setdefault("created_at", time.time())
+            record.setdefault("state", "captured")
+            record.setdefault("container_id", "")
             if record.get("source") == "http" and record.get("http_in_flight"):
                 record["http_activity_at"] = time.time()
-            is_new = self.db.execute("SELECT 1 FROM records WHERE id=?", (record["id"],)).fetchone() is None
-            self.db.execute("""INSERT INTO records VALUES (?,?,?,?,?,?,?,?)
+            prepared.append(record)
+        if not prepared:
+            return []
+        rows = [(record["id"], record["created_at"], record.get("source", "packet"), record.get("protocol", "TCP"),
+                 record["state"], record["container_id"], searchable(record), json.dumps(record, ensure_ascii=False))
+                for record in prepared]
+        ids = list(dict.fromkeys(record["id"] for record in prepared))
+        with self.lock, self.db:
+            existing = set()
+            for offset in range(0, len(ids), 500):
+                batch = ids[offset:offset+500]
+                existing.update(row[0] for row in self.db.execute(
+                    "SELECT id FROM records WHERE id IN (" + ",".join("?" for _ in batch) + ")", batch))
+            new_count = len(ids) - len(existing)
+            self.db.executemany("""INSERT INTO records VALUES (?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET created_at=excluded.created_at,
                 source=excluded.source,protocol=excluded.protocol,state=excluded.state,
-                container_id=excluded.container_id,search_text=excluded.search_text,data=excluded.data""",
-                (record["id"], record["created_at"], record.get("source", "packet"), record.get("protocol", "TCP"),
-                 record["state"], record["container_id"], searchable(record), json.dumps(record, ensure_ascii=False)))
+                container_id=excluded.container_id,search_text=excluded.search_text,data=excluded.data""", rows)
             now = time.time()
             self.db.execute("UPDATE capture_metrics SET captured_total=captured_total+?, "
                             "last_capture_at=CASE WHEN ? THEN ? ELSE last_capture_at END,last_activity_at=? WHERE id=1",
-                            (int(is_new), int(is_new), now, now))
+                            (new_count, new_count, now, now))
             # Keep pending decisions and unfinished HTTP responses; packet traffic must
             # not evict a long-lived response before its final body can be saved.
             excess = self.db.execute("SELECT MAX(COUNT(*)-?,0) FROM records", (self.max_records,)).fetchone()[0]
             if excess:
                 evicted = self.db.execute("DELETE FROM records WHERE id IN (SELECT id FROM records WHERE state NOT IN ('pending','resolving') AND NOT (source='http' AND COALESCE(json_extract(data,'$.http_in_flight'),0)=1) ORDER BY created_at ASC LIMIT ?)", (excess,)).rowcount
                 self.db.execute("UPDATE capture_metrics SET evicted_total=evicted_total+? WHERE id=1", (evicted,))
-        return record
+        return prepared
 
     def touch_http(self, record_ids: list[str]) -> int:
         """Renew active capture leases without reviving completed HTTP records."""

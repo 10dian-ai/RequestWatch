@@ -5,7 +5,7 @@
   const $ = (id) => document.getElementById(id);
   const stateNames = { captured: '已捕获', pending: '等待处理', resolving: '处理中', forwarded: '已放行', dropped: '已丢弃', error: '错误', replayed: '已重发' };
   const titles = { traffic: '网络流量', pending: '拦截队列', rules: '拦截规则', containers: 'Docker 容器', sessions: 'TCP 会话', settings: '项目设置', guide: '接入指南' };
-  const s = { view: 'traffic', status: null, records: [], containers: [], rules: [], selected: null, selectedId: null, tab: 'overview', polling: true, authenticated: true, refreshing: false, refreshAgain: false, offset: 0, limit: 50, total: 0, requestVersion: 0, detailVersion: 0, detailLoaded: false, detailLoading: false, detailError: '', editing: false, draftOriginal: null, actionBusy: false, lastInventory: 0 };
+  const s = { view: 'traffic', status: null, records: [], containers: [], rules: [], selected: null, selectedId: null, tab: 'content', polling: true, authenticated: true, refreshing: false, refreshAgain: false, offset: 0, limit: 50, total: 0, requestVersion: 0, detailVersion: 0, detailLoaded: false, detailLoading: false, detailError: '', editing: false, draftOriginal: null, actionBusy: false, lastInventory: 0 };
   let token = '';
   try { token = sessionStorage.getItem('requestwatch-token') || ''; } catch (_) { /* Session storage can be unavailable in hardened browsers. */ }
   let searchTimer;
@@ -20,9 +20,13 @@
   s.hexSide = 'request'; s.hexPage = 0;
   Object.assign(s, { sessions: [], sessionTotal: 0, sessionOffset: 0, sessionSelected: null, sessionId: null, sessionSide: 'client', sessionFormat: 'auto', sessionHexPage: 0, sessionVersion: 0 });
   const sessionBodyCache = new Map();
+  let recordSession = null;
+  const recordSessionBodies = new Map();
+  const recordSessionFormats = { client: 'auto', server: 'auto' };
+  const paneSearchValues = new Map();
   let sessionSearchTimer;
   const settingsState = { data: null, dirty: false, saving: false, applying: false, pendingToken: '', restartDone: false };
-  const settingNames = { host: 'Web 监听地址', port: '工作台端口', token: '管理令牌', capture_enabled: '抓包开关', interfaces: '网卡', queue_num: 'NFQUEUE 队列', protected_ports: '保护端口', pending_limit: '暂停容量', default_timeout_seconds: '规则默认等待', proxy_enabled: '代理开关', proxy_host: '代理地址', proxy_port: '代理端口', proxy_auth: '代理认证', mitmdump: 'mitmdump 路径', max_records: '保留记录数', tcp_idle_timeout: 'TCP 空闲超时' };
+  const settingNames = { host: 'Web 监听地址', port: '工作台端口', token: '管理令牌', passive_only: '只读观察', capture_enabled: '抓包开关', interfaces: '网卡', queue_num: 'NFQUEUE 队列', protected_ports: '保护端口', pending_limit: '暂停容量', default_timeout_seconds: '规则默认等待', proxy_enabled: '代理开关', proxy_host: '代理地址', proxy_port: '代理端口', proxy_auth: '代理认证', mitmdump: 'mitmdump 路径', max_records: '保留记录数', tcp_idle_timeout: 'TCP 空闲超时' };
 
   function element(tag, text, className) {
     const node = document.createElement(tag);
@@ -135,6 +139,7 @@
   }
   function renderStatus(status) {
     s.status = status;
+    syncReadOnlyActions();
     const stats = status.stats || {};
     ['pending', 'http', 'packets'].forEach((key) => { $(`stat-${key}`).textContent = Number(stats[key] || 0).toLocaleString('zh-CN'); });
     $('stat-total').textContent = Number(stats.captured_total ?? stats.total ?? 0).toLocaleString('zh-CN');
@@ -142,7 +147,7 @@
     $('nav-total').textContent = Number(stats.retained ?? stats.total ?? 0).toLocaleString('zh-CN');
     $('nav-pending').textContent = stats.pending || 0;
     $('demo-badge').hidden = status.mode !== 'demo';
-    $('demo-rule-tools').hidden = status.mode !== 'demo';
+    $('demo-rule-tools').hidden = status.mode !== 'demo' || status.passive_only === true;
     $('demo-notice').hidden = status.mode !== 'demo';
     $('server-port').textContent = `:${status.port || 7030}`;
     ['capture', 'proxy', 'docker'].forEach((key) => {
@@ -152,11 +157,25 @@
       $(`${key}-dot`).className = `engine-dot ${info.good ? 'online' : 'offline'}`;
     });
     const droppedPackets = Number(status.capture?.passive_dropped || 0);
-    message('capture-loss-alert', droppedPackets > 0 ? `观察队列过载，已丢弃 ${droppedPackets.toLocaleString('zh-CN')} 个包；部分连接可能缺少内容。请检查服务器负载与抓包范围。` : '', 'warning');
+    message('capture-loss-alert', droppedPackets > 0 ? `采集程序曾落后，${droppedPackets.toLocaleString('zh-CN')} 个抓包副本未保存，查看内容可能有缺口；原连接没有因此丢包。` : '', 'warning');
     $('guide-proxy-env').textContent = `HTTP_PROXY=http://<服务器IP>:${status.proxy_port || 8080}\nHTTPS_PROXY=http://<服务器IP>:${status.proxy_port || 8080}`;
     $('protected-ports').textContent = (status.protected_ports || [22, 7030, 8080]).join('、');
     $('runtime-summary').textContent = `工作台 :${status.port || 7030} · HTTP 代理 :${status.proxy_port || 8080} · ${status.mode === 'demo' ? '演示模式' : '实时模式'}。抓包：${engineInfo(status.capture).detail || engineInfo(status.capture).label}；代理：${engineInfo(status.proxy).detail || engineInfo(status.proxy).label}。`;
     connection('online', '服务已连接');
+  }
+  function isReadOnly() { return s.status?.passive_only === true; }
+  function syncReadOnlyActions() {
+    const readonly = isReadOnly();
+    document.querySelectorAll('.navigation [data-view="pending"], .navigation [data-view="rules"]').forEach(node => { node.hidden = readonly; });
+    $('stat-pending').closest('.stat').hidden = readonly;
+    const footnote = document.querySelector('#view-traffic .workspace-footnote > span:first-child');
+    if (footnote) footnote.textContent = readonly ? '只读观察 · 不暂停、不修改、不重发网络流量' : '按规则拦截 · 超时策略由服务端控制';
+    $('edit-button').hidden = readonly;
+    $('pending-actions').parentElement.hidden = readonly;
+    $('action-help').hidden = readonly;
+    if (s.view === 'traffic') $('traffic-subtitle').textContent = readonly ? '只读查看网络请求、响应正文和 TCP 双向通信。' : '查看每一次连接，按规则暂停，在放行前检查与修改。';
+    message('rules-readonly-note', readonly ? '当前为只读观察模式。已保存的规则不会暂停流量，也不会修改、丢弃或重发内容。' : '');
+    if (readonly) { $('edit-form').hidden = true; s.editing = false; s.draftOriginal = null; }
   }
   function renderCaptureSummary() {
     const status = s.status || {}; const stats = status.stats || {};
@@ -222,23 +241,44 @@
   }
   function renderRecords() {
     const focusedId = $('records-body').contains(document.activeElement) ? document.activeElement.closest('tr')?.dataset.id : null;
+    const focusedDetailButton = document.activeElement?.classList.contains('event-detail-button');
     const fragment = document.createDocumentFragment();
     s.records.forEach((record) => {
       const row = element('tr'); row.dataset.id = record.id; row.tabIndex = 0;
       row.classList.toggle('selected', record.id === s.selectedId);
       row.setAttribute('aria-selected', String(record.id === s.selectedId));
       row.setAttribute('aria-label', `${recordTitle(record)}，${stateNames[record.state] || record.state}`);
-      const timeCell = element('td'); timeCell.append(element('div', time(record.created_at), 'cell-time'), protocolBadge(record));
-      const target = element('td'); const title = element('div', recordTitle(record), 'cell-title'); title.title = record.url || record.summary || recordTitle(record); target.append(title, element('div', targetAddress(record), 'cell-subtitle'));
-      const origin = element('td'); const name = element('div', record.container_name || '本机 / 未识别', 'cell-container'); name.title = record.container_name || record.attribution || '没有足够信息确定容器来源'; origin.append(name, element('div', record.container_id ? String(record.container_id).slice(0, 10) : record.src_ip || '—', 'cell-container-detail'));
-      const status = element('td'); status.append(recordStateBadge(record));
-      row.append(timeCell, target, origin, status);
+      row.classList.add('event-row');
+      const failed = Boolean(record.error || record.state === 'error' || record.state === 'dropped' || Number(record.status_code) >= 400);
+      const pending = record.state === 'pending' || record.state === 'resolving';
+      const iconCell = element('td', null, 'event-icon-cell');
+      const icon = element('span', failed ? '!' : pending ? 'Ⅱ' : '✓', `event-status-icon ${failed ? 'error' : pending ? 'pending' : 'success'}`); icon.setAttribute('aria-hidden', 'true'); iconCell.append(icon);
+      const main = element('td', null, 'event-main');
+      const titleLine = element('div', null, 'event-title-line');
+      const titleText = record.source === 'http' && record.url ? `${record.method || 'GET'} ${record.url}` : record.summary || `${endpoint(record.src_ip, record.src_port)} → ${endpoint(record.dst_ip, record.dst_port)}`;
+      const title = element('div', titleText, 'event-title cell-title'); title.title = titleText; titleLine.append(title);
+      if (record.source === 'http' && record.status_code) titleLine.append(element('span', `HTTP ${record.status_code}`, `event-http-status ${Number(record.status_code) >= 400 ? 'error' : 'success'}`));
+      else titleLine.append(protocolBadge(record));
+      const descriptions = [stateNames[record.state] || record.state || '已捕获'];
+      if (record.source === 'http') { if (record.request_body_size !== undefined) descriptions.push(`请求体 ${bytes(record.request_body_size)}`); if (record.response_body_size !== undefined) descriptions.push(`响应体 ${bytes(record.response_body_size)}`); }
+      else descriptions.push(`本包 ${bytes(record.payload_size || 0)}`, record.protocol === 'TCP' ? '点击查看双向完整通信' : 'UDP 数据报');
+      const description = element('div', descriptions.join(' · '), 'event-description');
+      const metadata = element('div', null, 'event-metadata');
+      metadata.append(element('span', time(record.created_at, true), 'cell-time'), element('span', record.container_name || '本机 / 未识别', 'cell-container'));
+      if (record.response_streaming) metadata.append(element('span', '流式接收中', 'event-streaming'));
+      if (record.duration_ms !== undefined && record.duration_ms !== null) metadata.append(element('span', `${Number(record.duration_ms).toFixed(0)} ms`));
+      if (record.container_id) metadata.append(element('span', String(record.container_id).slice(0, 12), 'event-container-id'));
+      main.append(titleLine, description, metadata);
+      const actionCell = element('td', null, 'event-action-cell');
+      const button = element('button', '查看详情 ›', 'event-detail-button'); button.setAttribute('aria-label', `查看详情：${titleText}`);
+      button.addEventListener('click', event => { event.stopPropagation(); selectRecord(record.id); }); actionCell.append(button);
+      row.append(iconCell, main, actionCell);
       row.addEventListener('click', () => selectRecord(record.id));
-      row.addEventListener('keydown', (event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); selectRecord(record.id); } });
+      row.addEventListener('keydown', event => { if (event.target === row && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); selectRecord(record.id); } });
       fragment.append(row);
     });
     $('records-body').replaceChildren(fragment);
-    if (focusedId) Array.from($('records-body').children).find((row) => row.dataset.id === focusedId)?.focus({ preventScroll: true });
+    if (focusedId) { const row = [...$('records-body').children].find(row => row.dataset.id === focusedId); (focusedDetailButton ? row?.querySelector('.event-detail-button') : row)?.focus({ preventScroll: true }); }
     $('records-empty').hidden = Boolean(s.records.length);
     if (!s.records.length) {
       if (hasFilters()) emptyState($('records-empty'), '没有匹配的流量', '尝试缩短搜索词或减少筛选条件。正文、URL、请求头与网络地址都可以搜索。', { text: '清除筛选', run: resetFilters });
@@ -276,7 +316,7 @@
           const selectedId = s.selectedId; const detailVersion = s.detailVersion;
           try {
             const record = await api(`/api/records/${encodeURIComponent(selectedId)}`);
-            if (s.selectedId === selectedId && s.detailVersion === detailVersion) { s.selected = record; s.detailLoaded = true; s.detailLoading = false; s.detailError = ''; renderDetail(false); }
+            if (s.selectedId === selectedId && s.detailVersion === detailVersion) { s.selected = record; s.detailLoaded = true; s.detailLoading = false; s.detailError = ''; renderDetail(false); if (s.tab === 'content') loadRecordSession(record, true); }
           } catch (error) {
             if (error.status === 401 || error.status === 403) throw error;
             if (s.selectedId === selectedId && s.detailVersion === detailVersion) { s.detailLoading = false; s.detailError = error.message; renderDetail(false); }
@@ -310,6 +350,7 @@
       $('list-heading').textContent = view === 'pending' ? '等待处理' : '所有流量';
       $('filter-state').disabled = view === 'pending';
     }
+    syncRecordDrawer();
     if (location.hash !== `#${view}`) history.replaceState(null, '', `#${view}`);
     refresh(true);
   }
@@ -317,6 +358,7 @@
     if (s.selectedId === id && (s.detailLoading || (s.detailLoaded && !s.detailError))) return;
     if (s.actionBusy) { toast('当前操作正在提交，请稍候。'); return; }
     if (s.editing && draftDirty() && !await confirmAction('切换请求？', '当前草稿尚未提交，切换后将丢弃此草稿。', '切换请求')) return;
+    if (s.selectedId !== id) { s.tab = 'content'; recordSession = null; recordSessionBodies.clear(); }
     const previousRecord = s.selectedId === id ? s.selected : null;
     const previousLoaded = Boolean(previousRecord && s.detailLoaded);
     s.selectedId = id; s.detailLoaded = previousLoaded; s.detailLoading = true; s.detailError = ''; s.editing = false; s.draftOriginal = null;
@@ -395,15 +437,15 @@
       .finally(() => { if (s.selectedId === record.id && readableBodyEntry(s.selected, side) === entry) renderDetailBody(); });
     return entry;
   }
-  function renderHttpBody(target, record, side) {
+  function renderHttpBody(target, record, side, paired = false) {
     const format = s.bodyFormat[side];
     const entry = format === 'auto' ? loadReadableBody(record, side) : loadBody(record, side);
     const caption = side === 'request' ? '请求正文' : '响应正文';
     const controls = element('div', null, 'body-format-toolbar');
-    const label = element('label', '内容格式 '); const select = element('select'); select.id = 'http-body-format'; select.setAttribute('aria-label', 'HTTP 正文内容格式');
+    const label = element('label', '内容格式 '); const select = element('select'); select.id = paired ? `http-${side}-format` : 'http-body-format'; select.setAttribute('aria-label', `${caption}内容格式`);
     select.append(new Option('自动解析', 'auto'), new Option('UTF-8 原文', 'text')); select.value = format;
     select.addEventListener('change', () => { s.bodyFormat[side] = select.value; renderDetailBody(); }); label.append(select); controls.append(label);
-    if (format === 'auto' && entry?.state === 'ready' && entry.meta?.download_url) { const button = element('button', '下载解析全文 ↗', 'text-button'); button.id = 'http-download-readable'; button.addEventListener('click', () => download(entry.meta.download_url, `requestwatch-${record.id}-${side}-readable.txt`)); controls.append(button); }
+    if (format === 'auto' && entry?.state === 'ready' && entry.meta?.download_url) { const button = element('button', '下载解析全文 ↗', 'text-button'); button.id = paired ? `http-${side}-download-readable` : 'http-download-readable'; button.addEventListener('click', () => download(entry.meta.download_url, `requestwatch-${record.id}-${side}-readable.txt`)); controls.append(button); }
     target.append(controls);
     const status = element('div', null, 'body-status');
     if (!entry || entry.state === 'loading') {
@@ -484,10 +526,31 @@
     }
     return lines.join('\n');
   }
+  function syncRecordDrawer() {
+    const drawer = $('record-detail-drawer');
+    const visible = Boolean(s.selected) && ['traffic', 'pending'].includes(s.view);
+    const wasHidden = drawer.hidden;
+    drawer.hidden = !visible; $('detail-backdrop').hidden = !visible;
+    $('traffic-workbench').classList.toggle('detail-open', visible);
+    document.body.classList.toggle('record-drawer-open', visible);
+    if (visible && wasHidden) $('close-detail').focus({ preventScroll: true });
+  }
+  async function closeRecordDetail() {
+    if (s.actionBusy) { toast('当前操作正在提交，请稍候。'); return; }
+    if (s.editing && draftDirty() && !await confirmAction('关闭详情？', '当前草稿尚未提交，关闭后将丢弃此草稿。', '关闭详情')) return;
+    const previousId = s.selectedId;
+    s.selected = null; s.selectedId = null; s.editing = false; s.draftOriginal = null; s.detailVersion++;
+    renderDetail(); renderRecords();
+    const row = [...$('records-body').children].find(row => row.dataset.id === previousId);
+    (row?.querySelector('.event-detail-button') || $('filter-query')).focus({ preventScroll: true });
+  }
   function renderDetail(reset = false) {
     const record = s.selected;
+    document.querySelector('.traffic-workbench')?.classList.toggle('body-workspace-wide', Boolean(record) && s.tab === 'content');
+    $('detail-body').classList.toggle('primary-body-view', s.tab === 'content');
     $('detail-empty').hidden = Boolean(record);
     $('detail-content').hidden = !record;
+    syncRecordDrawer();
     if (!record) return;
     if (record.source === 'http' && s.detailLoaded) { loadBody(record, 'request'); loadBody(record, 'response'); }
     $('detail-inspector-label').textContent = record.source === 'http' ? 'HTTP INSPECTOR' : 'PACKET INSPECTOR';
@@ -512,6 +575,7 @@
     message('detail-alert', alerts.join(' '), `compact ${record.error || s.detailError ? 'danger' : record.state === 'pending' ? 'warning' : ''}`);
     $('detail-retry').hidden = !s.detailError; $('detail-retry').disabled = s.detailLoading;
     renderPacketContext(record);
+    syncReadOnlyActions();
     $('pending-actions').hidden = record.state !== 'pending';
     $('accept-button').disabled = s.actionBusy || !s.detailLoaded || record.state !== 'pending';
     $('drop-button').disabled = s.actionBusy || !s.detailLoaded || record.state !== 'pending';
@@ -530,8 +594,9 @@
     if (!record) return;
     document.querySelectorAll('[data-tab]').forEach((node) => { const selected = node.dataset.tab === s.tab; node.classList.toggle('active', selected); node.setAttribute('aria-selected', String(selected)); });
     const target = $('detail-body');
-    const loadState = ['request', 'response'].includes(s.tab) ? [bodyEntry(record, s.tab)?.state, readableBodyEntry(record, s.tab)?.state, readableBodyEntry(record, s.tab)?.error, s.bodyFormat[s.tab]] : null;
-    const renderKey = JSON.stringify([s.tab, record, s.detailLoaded, s.detailLoading, s.detailError, loadState, s.hexSide, s.hexPage, s.tab === 'hex' ? [...hexCache].map(([key, value]) => [key, value.state, value.error]) : null]);
+    const loadState = (s.tab === 'content' ? ['request', 'response'] : ['request', 'response'].includes(s.tab) ? [s.tab] : []).map(side => [bodyEntry(record, side)?.state, bodyEntry(record, side)?.error, readableBodyEntry(record, side)?.state, readableBodyEntry(record, side)?.error, s.bodyFormat[side]]);
+    const inlineState = s.tab === 'content' && record.source !== 'http' ? [recordSession?.id, recordSession?.state, recordSession?.error, recordSession?.session, [...recordSessionBodies].map(([key, entry]) => [key, entry.key, entry.state, entry.error]), recordSessionFormats] : null;
+    const renderKey = JSON.stringify([s.tab, record, s.detailLoaded, s.detailLoading, s.detailError, loadState, inlineState, s.hexSide, s.hexPage, s.tab === 'hex' ? [...hexCache].map(([key, value]) => [key, value.state, value.error]) : null]);
     if (target.dataset.renderKey === renderKey) return;
     target.dataset.renderKey = renderKey;
     rememberReading(target);
@@ -540,7 +605,9 @@
       target.append(element('p', s.detailLoading ? '正在读取完整记录。读取完成后显示全部已保存的内容。' : '完整记录尚未加载，请点击上方“重新读取详情”。', 'detail-note'));
       return;
     }
-    if (s.tab === 'overview') {
+    if (s.tab === 'content') {
+      renderPrimaryBodies(target, record);
+    } else if (s.tab === 'overview') {
       const list = element('dl', null, 'metadata');
       addMetadata(list, '捕获时间', time(record.created_at, true));
       addMetadata(list, '接入类型', record.source === 'http' ? 'HTTP 代理' : '网络包 / NFQUEUE');
@@ -579,6 +646,7 @@
     target.dataset.readingReady = String(!['request', 'response'].includes(s.tab) || record.source !== 'http' || (s.bodyFormat[s.tab] === 'auto' ? readableBodyEntry(record, s.tab)?.state : bodyEntry(record, s.tab)?.state) === 'ready');
   }
   function openEditor() {
+    if (isReadOnly()) { toast('当前为只读观察模式，不能修改流量。'); return; }
     if (!s.selected || !s.detailLoaded) return;
     if (s.editing) { $('edit-form').hidden = !$('edit-form').hidden; $('edit-button').textContent = $('edit-form').hidden ? '展开编辑草稿' : '收起编辑草稿'; return; }
     const record = s.selected;
@@ -640,6 +708,7 @@
   }
   function finishConfirm(accepted) { $('confirm-dialog').close(); const resolve = confirmResolve; confirmResolve = null; if (resolve) resolve(accepted); }
   async function recordAction(action) {
+    if (isReadOnly()) { toast('当前为只读观察模式，不能暂停、修改、丢弃或重发流量。'); return; }
     if (!s.selected || !s.detailLoaded || s.actionBusy) return;
     const record = s.selected;
     let edited;
@@ -655,7 +724,7 @@
       const result = await api(`/api/records/${encodeURIComponent(record.id)}/${action === 'replay' ? 'replay' : 'decision'}`, { method: 'POST', body: JSON.stringify(action === 'replay' ? { edits: edited } : { action, edits: edited }) });
       toast(action === 'replay' ? '重发操作已提交' : action === 'accept' ? '请求已放行' : '请求已丢弃');
       s.editing = false; s.draftOriginal = null; $('edit-form').hidden = true; $('edit-button').textContent = '编辑内容';
-      if (action === 'replay' && result?.id) { s.selectedId = result.id; s.selected = result; s.detailLoaded = true; renderDetail(true); }
+      if (action === 'replay' && result?.id) { s.selectedId = result.id; s.selected = result; s.detailLoaded = true; s.tab = 'content'; recordSession = null; recordSessionBodies.clear(); renderDetail(true); }
       else { const fresh = await api(`/api/records/${encodeURIComponent(record.id)}`); if (s.selectedId === record.id) { s.selected = fresh; s.detailLoaded = true; renderDetail(true); } }
       refresh(true);
     } catch (error) {
@@ -675,13 +744,141 @@
     } catch (error) { toast(`下载失败：${error.message}`, true); }
   }
 
+  function makeBodyPane(workspace, side, title, subtitle = '') {
+    const pane = element('section', null, 'body-pane'); pane.dataset.bodySide = side;
+    const heading = element('div', null, 'body-pane-heading');
+    heading.append(element('h3', title, 'body-pane-title'));
+    if (subtitle) heading.append(element('p', subtitle, 'body-pane-subtitle'));
+    pane.append(heading);
+    const toolbar = element('div', null, 'body-pane-toolbar'); pane.append(toolbar);
+    const content = element('div', null, 'body-pane-content'); pane.append(content); workspace.append(pane);
+    return { pane, toolbar, content };
+  }
+  function addPaneDownload(target, caption, path, filename) {
+    const button = element('button', caption, 'text-button'); button.addEventListener('click', () => download(path, filename)); target.append(button);
+  }
+  function addPaneSearch(pane, toolbar, key) {
+    const search = element('input'); search.type = 'search'; search.placeholder = '搜索此处全文'; search.setAttribute('aria-label', '搜索此处全文'); search.value = paneSearchValues.get(key) || '';
+    search.addEventListener('input', () => { paneSearchValues.set(key, search.value); if (paneSearchValues.size > 40) paneSearchValues.delete(paneSearchValues.keys().next().value); });
+    const button = element('button', '查找', 'text-button');
+    const find = () => {
+      const query = search.value; if (!query) return;
+      const blocks = [...pane.querySelectorAll('.body-pane-content pre')];
+      const previous = Number(search.dataset.match || '-1'); let match = null;
+      for (let index = 0; index < blocks.length; index++) {
+        const start = index === Number(search.dataset.block) && search.dataset.query === query ? previous + 1 : 0;
+        const at = blocks[index].textContent.toLocaleLowerCase().indexOf(query.toLocaleLowerCase(), start);
+        if (at >= 0) { match = { block: blocks[index], index, at }; break; }
+      }
+      if (!match) { search.dataset.match = '-1'; search.dataset.block = '-1'; toast('此处后续内容没有匹配；再次查找将从开头开始。'); return; }
+      search.dataset.query = query; search.dataset.match = String(match.at); search.dataset.block = String(match.index);
+      const textNode = match.block.firstChild; if (!textNode || textNode.nodeType !== Node.TEXT_NODE) return;
+      const range = document.createRange(); range.setStart(textNode, match.at); range.setEnd(textNode, match.at + query.length);
+      const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(range);
+      const rect = range.getBoundingClientRect(); const box = match.block.getBoundingClientRect(); match.block.scrollTop += rect.top - box.top - 30;
+    };
+    button.addEventListener('click', find); search.addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); find(); } }); toolbar.append(search, button);
+  }
+  function renderPrimaryBodies(target, record) {
+    const workspace = element('div', null, 'body-workspace'); target.append(workspace);
+    if (record.source === 'http') {
+      for (const side of ['request', 'response']) {
+        const caption = side === 'request' ? '请求体' : '响应体';
+        const { pane, toolbar, content } = makeBodyPane(workspace, side, caption, side === 'request' ? `${record.method || 'GET'} ${record.url || ''}` : record.status_code ? `HTTP ${record.status_code}${bodyStreaming(record, side) ? ' · 持续接收中' : ''}` : '等待服务器响应');
+        if (side === 'response' && !bodyPresent(record, side)) {
+          content.append(element('p', record.state === 'pending' ? '请求尚未放行，暂无响应正文。' : record.state === 'dropped' ? '请求已丢弃，没有响应正文。' : '正在等待响应正文。', 'body-empty-state'));
+          continue;
+        }
+        const base = `/api/records/${encodeURIComponent(record.id)}`;
+        addPaneDownload(toolbar, '下载原始正文', `${base}/body/${side}?view=raw&download=true`, `requestwatch-${record.id}-${side}.bin`);
+        addPaneDownload(toolbar, side === 'request' ? '下载请求含头' : '下载响应含头', `${base}/message/${side}`, `requestwatch-${record.id}-${side}.http`);
+        addPaneSearch(pane, toolbar, `${record.id}:${side}`);
+        renderHttpBody(content, record, side, true);
+        if (!record[`${side}_body_size`] && !bodyStreaming(record, side)) content.append(element('p', side === 'request' ? '无请求正文；请求行和请求头可在下方展开。' : '无响应正文。', 'body-empty-state'));
+        const headers = element('details', null, 'body-pane-headers'); headers.append(element('summary', side === 'request' ? '请求行与请求头' : '响应头'));
+        if (side === 'request') addCode(headers, '请求行', `${record.method || 'GET'} ${record.url || ''}`);
+        addCode(headers, side === 'request' ? '请求头' : '响应头', headerText(record[`${side}_headers`])); pane.append(headers);
+      }
+      return;
+    }
+    if (record.protocol === 'TCP' && record.tcp_session_id && record.tcp_session_available !== false) {
+      const entry = loadRecordSession(record);
+      if (!entry?.session) {
+        const { content } = makeBodyPane(workspace, 'connection', '正在读取此连接的双向内容');
+        content.append(element('p', entry?.error ? `连接读取失败：${entry.error}` : '正在读取已捕获的完整连接，随后直接显示两个方向的内容。', 'body-empty-state'));
+        if (entry?.error) { const retry = element('button', '重新读取连接', 'button secondary compact'); retry.addEventListener('click', () => { loadRecordSession(record, true); renderDetailBody(); }); content.append(retry); }
+        return;
+      }
+      const session = entry.session;
+      for (const side of ['client', 'server']) renderInlineTcpPane(workspace, record, session, side);
+      const notes = sessionWarnings(session); if (entry.error) notes.unshift(`更新失败：${entry.error}；保留上次成功读取的内容。`);
+      if (notes.length) { const details = element('details', null, 'body-capture-notes'); details.append(element('summary', '连接完整性说明'), element('p', notes.join(' '), 'detail-note')); target.append(details); }
+      return;
+    }
+    const { content } = makeBodyPane(workspace, 'packet', record.protocol === 'TCP' ? '单包载荷 · 关联连接不可用' : 'UDP 数据报内容');
+    if (record.protocol === 'TCP') content.append(element('p', record.tcp_session_error || record.tcp_session_unavailable_reason || '此记录没有可用的关联会话，下面仅是当前包，无法从一个包补出其余通信内容。', 'body-empty-state'));
+    addCode(content, '全部已保存载荷', packetPayloadText(record), 'full-body packet-full-body');
+    if (!record.payload_size) content.append(element('p', '此包没有应用载荷，可能是握手、确认或关闭报文。', 'body-empty-state'));
+  }
+  function loadRecordSession(record, refresh = false) {
+    if (record.source === 'http' || record.protocol !== 'TCP' || !record.tcp_session_id || record.tcp_session_available === false) return null;
+    const id = record.tcp_session_id;
+    if (recordSession?.id !== id) { recordSession = { id, state: 'idle', session: null, error: '' }; recordSessionBodies.clear(); }
+    const entry = recordSession;
+    if (entry.state === 'loading' || (!refresh && entry.state !== 'idle')) return entry;
+    entry.state = 'loading'; entry.error = '';
+    api(`/api/sessions/${encodeURIComponent(id)}`)
+      .then(session => { entry.session = session; entry.state = 'ready'; })
+      .catch(error => { entry.error = error.message; entry.state = 'error'; })
+      .finally(() => { if (recordSession === entry && s.selected?.tcp_session_id === id && s.tab === 'content') renderDetailBody(); });
+    return entry;
+  }
+  function loadInlineTcpBody(session, side, format) {
+    const slot = `${side}:${format}`; const key = sessionKey(session, side, format);
+    const current = recordSessionBodies.get(slot); if (current?.key === key) return current;
+    const entry = { key, state: 'loading', previous: current?.state === 'ready' ? current : current?.previous }; recordSessionBodies.set(slot, entry);
+    const base = `/api/sessions/${encodeURIComponent(session.id)}`;
+    const task = format === 'auto'
+      ? api(`${base}/readable/${side}`, { timeoutMs: 120000 }).then(async meta => { entry.meta = meta; return await api(meta.content_url, { responseType: 'text', timeoutMs: 120000 }); })
+      : api(`${base}/body/${side}?view=${format}`, { responseType: 'text', timeoutMs: 120000 });
+    task.then(content => { entry.content = content; entry.state = 'ready'; entry.previous = null; })
+      .catch(error => { entry.error = error.message; entry.state = 'error'; })
+      .finally(() => { if (recordSession?.id === session.id && recordSessionBodies.get(slot) === entry && s.tab === 'content') renderDetailBody(); });
+    return entry;
+  }
+  function renderInlineTcpPane(workspace, record, session, side) {
+    const direction = session.directions?.[side] || {};
+    const format = recordSessionFormats[side]; const entry = loadInlineTcpBody(session, side, format);
+    const caption = sessionDirectionLabel(session, side);
+    const from = side === 'client' ? endpoint(session.client_ip, session.client_port) : endpoint(session.server_ip, session.server_port);
+    const to = side === 'client' ? endpoint(session.server_ip, session.server_port) : endpoint(session.client_ip, session.client_port);
+    const { pane, toolbar, content } = makeBodyPane(workspace, side, caption, `${from} → ${to} · ${bytes(direction.byte_count)} 已保存`);
+    pane.classList.toggle('packet-current-direction', record.tcp_session_direction === side);
+    const select = element('select'); select.id = `inline-tcp-${side}-format`; select.setAttribute('aria-label', `${caption}内容格式`);
+    select.append(new Option('自动解析', 'auto'), new Option('UTF-8 原文', 'text'), new Option('Latin-1 原文', 'latin1')); select.value = format;
+    select.addEventListener('change', () => { recordSessionFormats[side] = select.value; renderDetailBody(); }); toolbar.append(select);
+    addPaneDownload(toolbar, '下载全部原始字节', `/api/sessions/${encodeURIComponent(session.id)}/body/${side}?view=raw&download=true`, `requestwatch-session-${session.id}-${side}.bin`);
+    if (entry.meta?.download_url) addPaneDownload(toolbar, '下载解析全文', entry.meta.download_url, `requestwatch-session-${session.id}-${side}.txt`);
+    addPaneSearch(pane, toolbar, `${session.id}:${side}`);
+    if (!direction.byte_count) content.append(element('p', session.state === 'open' ? '此方向尚未捕获到应用内容，收到后会继续显示。' : '此方向未保存应用内容。', 'body-empty-state'));
+    const shown = entry.state === 'ready' ? entry : entry.previous;
+    if (shown) {
+      if (format === 'auto') appendReadable(content, shown, caption, 'inline-tcp-body');
+      else addCode(content, caption, shown.content, 'full-body inline-tcp-body');
+    }
+    if (entry.state === 'loading') content.append(element('p', shown ? '正在更新此方向内容…' : '正在读取此方向全部已捕获内容…', 'detail-note'));
+    if (entry.state === 'error') {
+      content.append(element('p', `正文读取失败：${entry.error}`, 'detail-note body-error'));
+      const retry = element('button', '重新读取正文', 'button secondary compact'); retry.addEventListener('click', () => { recordSessionBodies.delete(`${side}:${format}`); renderDetailBody(); }); content.append(retry);
+    }
+  }
   function packetPayloadText(record) {
     const hex = requestBytes(record);
     if (!hex || hex.length % 2 || !/^[0-9a-f]+$/i.test(hex)) return record.payload_text || '';
     return new TextDecoder('utf-8').decode(Uint8Array.from(hex.match(/../g), value => parseInt(value, 16)));
   }
   function renderPacketContext(record) {
-    const target = $('packet-context'); target.replaceChildren(); target.hidden = record.source === 'http';
+    const target = $('packet-context'); target.replaceChildren(); target.hidden = record.source === 'http' || s.tab === 'content';
     if (target.hidden) return;
     const isTcp = record.protocol === 'TCP';
     target.append(element('p', isTcp ? '当前是一条 TCP 包，通常只包含请求或响应中的一小段。整段对话请打开关联会话，查看两个方向的重组内容。' : '当前是一条 UDP 数据报，下面显示本条数据报已保存的全部载荷。', 'detail-note'));
@@ -1039,10 +1236,23 @@
   ['filter-protocol', 'filter-container', 'filter-state'].forEach((id) => $(id).addEventListener('change', filterChanged));
   $('reset-filters').addEventListener('click', resetFilters);
   $('refresh-button').addEventListener('click', () => refresh(true));
-  $('poll-button').addEventListener('click', () => { s.polling = !s.polling; $('poll-button').setAttribute('aria-pressed', String(s.polling)); $('poll-button').className = `button ${s.polling ? 'primary' : 'secondary'}`; $('poll-button').replaceChildren(...(s.polling ? [element('span', null, 'live-dot'), element('span', '实时刷新')] : [element('span', '继续刷新')])); renderCaptureSummary(); if (s.polling) refresh(true); toast(s.polling ? '已恢复每 2 秒刷新' : '已暂停页面刷新，服务端仍会继续采集与处理超时'); });
+  $('poll-button').addEventListener('click', () => { s.polling = !s.polling; $('poll-button').setAttribute('aria-pressed', String(s.polling)); $('poll-button').className = `button ${s.polling ? 'primary' : 'secondary'}`; $('poll-button').replaceChildren(...(s.polling ? [element('span', null, 'live-dot'), element('span', '实时刷新')] : [element('span', '继续刷新')])); renderCaptureSummary(); if (s.polling) refresh(true); toast(s.polling ? '已恢复每 2 秒刷新' : '已暂停页面刷新，服务端仍会继续采集'); });
   $('previous-page').addEventListener('click', () => { s.offset = Math.max(0, s.offset - s.limit); s.requestVersion++; refresh(true); });
   $('next-page').addEventListener('click', () => { if (s.offset + s.limit < s.total) { s.offset += s.limit; s.requestVersion++; refresh(true); } });
-  $('close-detail').addEventListener('click', async () => { if (s.actionBusy) { toast('当前操作正在提交，请稍候。'); return; } if (s.editing && draftDirty() && !await confirmAction('关闭详情？', '当前草稿尚未提交，关闭后将丢弃此草稿。', '关闭详情')) return; s.selected = null; s.selectedId = null; s.editing = false; s.draftOriginal = null; s.detailVersion++; renderDetail(); renderRecords(); });
+  $('detail-refresh').addEventListener('click', () => refresh(true));
+  $('close-detail').addEventListener('click', closeRecordDetail);
+  $('detail-backdrop').addEventListener('click', closeRecordDetail);
+  document.addEventListener('keydown', event => {
+    if ($('record-detail-drawer').hidden || document.querySelector('dialog[open]')) return;
+    if (event.key === 'Escape') { event.preventDefault(); closeRecordDetail(); }
+    if (event.key === 'Tab') {
+      const controls = [...$('record-detail-drawer').querySelectorAll('button, input, select, textarea, a[href], summary, [tabindex]')].filter(node => !node.disabled && node.tabIndex >= 0 && node.getClientRects().length);
+      if (!controls.length) return;
+      const first = controls[0]; const last = controls[controls.length - 1];
+      if (event.shiftKey && (document.activeElement === first || !$('record-detail-drawer').contains(document.activeElement))) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    }
+  });
   $('detail-retry').addEventListener('click', () => { if (s.selectedId) selectRecord(s.selectedId); });
   $('edit-button').addEventListener('click', openEditor);
   $('edit-form').addEventListener('submit', (event) => event.preventDefault());
@@ -1070,7 +1280,7 @@
     try {
       const record = await api('/api/demo/intercept', { method: 'POST' });
       toast(record.state === 'pending' ? '演示请求已进入拦截队列' : '演示请求已生成');
-      s.selectedId = record.id; s.selected = record; s.detailLoaded = true; s.editing = false; s.draftOriginal = null;
+      s.selectedId = record.id; s.selected = record; s.detailLoaded = true; s.tab = 'content'; recordSession = null; recordSessionBodies.clear(); s.editing = false; s.draftOriginal = null;
       $('edit-form').hidden = true; $('edit-button').textContent = '编辑内容';
       setView(record.state === 'pending' ? 'pending' : 'traffic'); renderDetail(true);
     } catch (error) { toast(`生成失败：${error.message}`, true); }

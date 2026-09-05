@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import codecs
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -95,50 +96,119 @@ class TCPStreamStore:
                 "direction_inferred": not bool(info.flags & 2),
                 "directions": {"client": self._direction(), "server": self._direction()}}
 
+    def _batch_file(self, session_id, direction):
+        key = (session_id, direction)
+        stream = self._batch["files"].get(key)
+        if stream is None:
+            # Open once per batch, already private at creation. Append mode never
+            # overwrites bytes used by an existing immutable export snapshot.
+            fd = os.open(self._spool(session_id, direction), os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
+            stream = os.fdopen(fd, "a+b", buffering=0)
+            self._batch["files"][key] = stream
+        return stream
+
+    def _flush_tail(self, key):
+        tail = self._batch["tails"].get(key)
+        if tail and tail.get("dirty"):
+            self.db.execute("UPDATE ranges SET end=? WHERE session_id=? AND direction=? AND start=?",
+                            (tail["end"], *key, tail["start"]))
+            tail["dirty"] = False
+
     def _append(self, session_id, direction, start, payload):
-        """Append only new ranges, comparing overlaps in packet-sized bounded memory."""
-        end = start + len(payload)
-        path = self._spool(session_id, direction)
+        """Append every observed byte, batching the common contiguous range update."""
+        end, key = start + len(payload), (session_id, direction)
+        stream = self._batch_file(session_id, direction)
+        if key not in self._batch["tails"]:
+            row = self.db.execute("SELECT start,end,file_offset FROM ranges WHERE session_id=? "
+                                  "AND direction=? ORDER BY start DESC LIMIT 1", key).fetchone()
+            self._batch["tails"][key] = dict(row) if row else None
+        tail = self._batch["tails"].get(key)
+        stream.seek(0, os.SEEK_END)
+        if tail and start == tail["end"] and stream.tell() == tail["file_offset"] + tail["end"] - tail["start"]:
+            if stream.write(payload) != len(payload):
+                raise OSError("Short write while saving TCP payload")
+            tail["end"], tail["dirty"] = end, True
+            return len(payload), 0
+        # Out-of-order/retransmitted bytes use the exact overlap algorithm. Flush
+        # the deferred contiguous tail first so SQL sees every earlier byte.
+        self._flush_tail(key)
+        self._batch["tails"].pop(key, None)
         overlaps = self.db.execute("SELECT start,end,file_offset FROM ranges WHERE session_id=? "
                                   "AND direction=? AND end>? AND start<? ORDER BY start",
                                   (session_id, direction, start, end)).fetchall()
         uncovered, cursor, conflicts = [], start, 0
-        if overlaps:
-            with path.open("rb") as stream:
-                for row in overlaps:
-                    left, right = max(start, row["start"]), min(end, row["end"])
-                    if cursor < left:
-                        uncovered.append((cursor, left))
-                    stream.seek(row["file_offset"] + left - row["start"])
-                    old = stream.read(right - left)
-                    conflicts += sum(a != b for a, b in zip(old, payload[left-start:right-start]))
-                    cursor = max(cursor, right)
+        for row in overlaps:
+            left, right = max(start, row["start"]), min(end, row["end"])
+            if cursor < left:
+                uncovered.append((cursor, left))
+            stream.seek(row["file_offset"] + left - row["start"])
+            old = stream.read(right - left)
+            if len(old) != right - left:
+                raise OSError("TCP spool is shorter than its recorded ranges")
+            conflicts += sum(a != b for a, b in zip(old, payload[left-start:right-start]))
+            cursor = max(cursor, right)
         if cursor < end:
             uncovered.append((cursor, end))
         added = 0
-        if uncovered:
-            with path.open("ab") as stream:
-                for left, right in uncovered:
-                    offset = stream.tell()
-                    stream.write(payload[left-start:right-start])
-                    # Common in-order traffic stays a single range; no per-packet full-file rewrite.
-                    previous = self.db.execute("SELECT start,end,file_offset FROM ranges WHERE "
-                                               "session_id=? AND direction=? AND end=?",
-                                               (session_id, direction, left)).fetchone()
-                    if previous and previous["file_offset"] + previous["end"] - previous["start"] == offset:
-                        self.db.execute("UPDATE ranges SET end=? WHERE session_id=? AND direction=? AND start=?",
-                                        (right, session_id, direction, previous["start"]))
-                    else:
-                        self.db.execute("INSERT INTO ranges VALUES(?,?,?,?,?)",
-                                        (session_id, direction, left, right, offset))
-                    added += right-left
-            try:
-                path.chmod(0o600)
-            except OSError:
-                pass
+        for left, right in uncovered:
+            stream.seek(0, os.SEEK_END)
+            offset = stream.tell()
+            if stream.write(payload[left-start:right-start]) != right-left:
+                raise OSError("Short write while saving TCP payload")
+            previous = self.db.execute("SELECT start,end,file_offset FROM ranges WHERE "
+                                       "session_id=? AND direction=? AND end=?", (session_id, direction, left)).fetchone()
+            if previous and previous["file_offset"] + previous["end"] - previous["start"] == offset:
+                self.db.execute("UPDATE ranges SET end=? WHERE session_id=? AND direction=? AND start=?",
+                                (right, session_id, direction, previous["start"]))
+            else:
+                self.db.execute("INSERT INTO ranges VALUES(?,?,?,?,?)", (session_id, direction, left, right, offset))
+            added += right-left
         return added, conflicts
 
     def ingest(self, record):
+        return self.ingest_many([record])[0]
+
+    def ingest_many(self, records):
+        """One capture batch, one SQLite commit; every packet keeps its identity."""
+        records = list(records)
+        if not records:
+            return []
+        with self.lock:
+            with self.db:
+                self._batch = {"files": {}, "tails": {}, "flows": {}, "dirty": {},
+                               "seen": {}, "new_seen": {}, "new_sessions": False}
+                try:
+                    ids = list(dict.fromkeys(str(record["id"]) for record in records if record.get("id")))
+                    for offset in range(0, len(ids), 500):
+                        batch = ids[offset:offset+500]
+                        self._batch["seen"].update((row[0], row[1]) for row in self.db.execute(
+                            "SELECT record_id,session_id FROM seen WHERE record_id IN (" + ",".join("?" for _ in batch) + ")", batch))
+                    result = [self._ingest_one(record) for record in records]
+                    for key in list(self._batch["tails"]):
+                        self._flush_tail(key)
+                    for item in self._batch["dirty"].values():
+                        self._save(item)
+                    self.db.executemany("INSERT INTO seen VALUES(?,?)", self._batch["new_seen"].items())
+                    self.db.execute("DELETE FROM seen WHERE rowid <= (SELECT MAX(rowid)-65536 FROM seen)")
+                    victims = self._trim_batch()
+                    new_sessions = self._batch["new_sessions"]
+                finally:
+                    try:
+                        for stream in self._batch["files"].values():
+                            stream.close()
+                    finally:
+                        self._batch = None
+            # A failed close or COMMIT above restores the old session metadata.
+            # Only now is it safe to remove the corresponding physical files.
+            try:
+                self._cleanup_retired(victims, new_sessions)
+            except (OSError, sqlite3.Error):
+                # Capture has already committed. Cleanup failure must not make the
+                # worker retry a successful batch or lose existing raw captures.
+                logging.getLogger(__name__).exception("TCP retention cleanup deferred")
+            return result
+
+    def _ingest_one(self, record):
         if record.get("protocol") != "TCP" or record.get("source", "packet") != "packet":
             return None
         try:
@@ -149,120 +219,129 @@ class TCPStreamStore:
             return None
         now = float(record.get("created_at", time.time()))
         flow = json.dumps(sorted(((info.src_ip, info.src_port), (info.dst_ip, info.dst_port))))
-        with self.lock, self.db:
-            if record.get("id"):
-                duplicate = self.db.execute("SELECT session_id FROM seen WHERE record_id=?",
-                                            (str(record["id"]),)).fetchone()
-                if duplicate:
-                    return duplicate[0]
-            row = self.db.execute("SELECT data FROM sessions WHERE flow=? ORDER BY updated_at DESC LIMIT 1",
-                                  (flow,)).fetchone()
+        if record.get("id"):
+            duplicate = self._batch["seen"].get(str(record["id"]))
+            if duplicate:
+                return duplicate
+        if flow in self._batch["flows"]:
+            item = self._batch["flows"][flow]
+        else:
+            row = self.db.execute("SELECT data FROM sessions WHERE flow=? ORDER BY updated_at DESC LIMIT 1", (flow,)).fetchone()
             item = json.loads(row[0]) if row else None
-            initial_syn = bool(info.flags & 2 and not info.flags & 16)
-            if item:
-                direction = "client" if (info.src_ip, info.src_port) == (item["client_ip"], item["client_port"]) else "server"
-                data = item["directions"][direction]
-                same_syn = data["syn_seen"] and ((info.sequence + 1) & 0xffffffff) == data["anchor"]
-                expired = now - item["updated_at"] > self.idle_timeout
-                new_syn = initial_syn and (not same_syn or item["state"] != "open")
-                # Payload beyond an observed close belongs to an unobserved new incarnation;
-                # ordinary final ACKs and retransmissions within the old ranges stay with it.
-                closed_reuse = False
-                if item["state"] in ("closed", "reset") and info.payload and data["anchor"] is not None:
-                    incoming = self._position(info.sequence, data)
-                    lower_bound = data["start_offset"]
-                    if lower_bound is None:
-                        # Midstream/out-of-order capture may extend before the
-                        # initial anchor. Those negative offsets are still part
-                        # of this connection, including late retransmissions.
-                        lower_bound = self.db.execute(
-                            "SELECT MIN(start) FROM ranges WHERE session_id=? AND direction=?",
-                            (item["id"], direction)).fetchone()[0]
-                    closed_reuse = (incoming < (lower_bound if lower_bound is not None else 0)
-                                    or (data["fin_offset"] is not None
-                                        and incoming + len(info.payload) > data["fin_offset"])
-                                    or (item["state"] == "reset"
-                                        and incoming + len(info.payload) > data["high_end"]))
-                if expired or new_syn or closed_reuse or item["state"] == "interrupted":
-                    if item["state"] == "open":
-                        item["state"] = "interrupted"
-                        self._save(item)
-                    item = None
-            is_new = item is None
-            if item is None:
-                item = self._new(info, now, flow)
-                self._save(item)  # Foreign-key target for ranges.
+        initial_syn = bool(info.flags & 2 and not info.flags & 16)
+        if item:
             direction = "client" if (info.src_ip, info.src_port) == (item["client_ip"], item["client_port"]) else "server"
             data = item["directions"][direction]
-            payload_seq = (info.sequence + int(bool(info.flags & 2))) & 0xffffffff
-            if data["anchor"] is None:
-                data["anchor"] = payload_seq
-            position = self._position(payload_seq, data)
-            data["high_end"] = max(data["high_end"], position + len(info.payload))
-            if info.flags & 2:
-                data["syn_seen"] = True
-                data["start_offset"] = position
-                if direction == "client" and not info.flags & 16:
-                    item["midstream"] = False
-            data["truncated_packets"] += int(info.truncated)
-            data["fragmented_packets"] += int(info.fragmented)
-            # Fragmented transport payload cannot be distinguished safely from a complete segment.
-            if info.payload and not info.fragmented:
-                added, conflicts = self._append(item["id"], direction, position, info.payload)
-                data["byte_count"] += added
-                data["overlap_conflicts"] += conflicts
-                data["segment_count"] += 1
-                if added:
-                    data["revision"] += 1
-            if ((info.payload or info.flags & 3) and data["start_offset"] is not None
-                    and position < data["start_offset"]):
+            same_syn = data["syn_seen"] and ((info.sequence + 1) & 0xffffffff) == data["anchor"]
+            expired = now - item["updated_at"] > self.idle_timeout
+            new_syn = initial_syn and (not same_syn or item["state"] != "open")
+            # Payload beyond an observed close belongs to an unobserved new incarnation;
+            # ordinary final ACKs and retransmissions within the old ranges stay with it.
+            closed_reuse = False
+            if item["state"] in ("closed", "reset") and info.payload and data["anchor"] is not None:
+                incoming = self._position(info.sequence, data)
+                lower_bound = data["start_offset"]
+                if lower_bound is None:
+                    # Midstream/out-of-order capture may extend before the
+                    # initial anchor. Those negative offsets are still part
+                    # of this connection, including late retransmissions.
+                    self._flush_tail((item["id"], direction))
+                    lower_bound = self.db.execute(
+                        "SELECT MIN(start) FROM ranges WHERE session_id=? AND direction=?",
+                        (item["id"], direction)).fetchone()[0]
+                closed_reuse = (incoming < (lower_bound if lower_bound is not None else 0)
+                                or (data["fin_offset"] is not None
+                                    and incoming + len(info.payload) > data["fin_offset"])
+                                or (item["state"] == "reset"
+                                    and incoming + len(info.payload) > data["high_end"]))
+            if expired or new_syn or closed_reuse or item["state"] == "interrupted":
+                if item["state"] == "open":
+                    item["state"] = "interrupted"
+                    self._save(item)
+                item = None
+        if item is None:
+            self._batch["new_sessions"] = True
+            item = self._new(info, now, flow)
+            self._save(item)  # Foreign-key target for ranges.
+        direction = "client" if (info.src_ip, info.src_port) == (item["client_ip"], item["client_port"]) else "server"
+        data = item["directions"][direction]
+        payload_seq = (info.sequence + int(bool(info.flags & 2))) & 0xffffffff
+        if data["anchor"] is None:
+            data["anchor"] = payload_seq
+        position = self._position(payload_seq, data)
+        data["high_end"] = max(data["high_end"], position + len(info.payload))
+        if info.flags & 2:
+            data["syn_seen"] = True
+            data["start_offset"] = position
+            if direction == "client" and not info.flags & 16:
+                item["midstream"] = False
+        data["truncated_packets"] += int(info.truncated)
+        data["fragmented_packets"] += int(info.fragmented)
+        # Fragmented transport payload cannot be distinguished safely from a complete segment.
+        if info.payload and not info.fragmented:
+            added, conflicts = self._append(item["id"], direction, position, info.payload)
+            data["byte_count"] += added
+            data["overlap_conflicts"] += conflicts
+            data["segment_count"] += 1
+            if added:
+                data["revision"] += 1
+        if ((info.payload or info.flags & 3) and data["start_offset"] is not None
+                and position < data["start_offset"]):
+            data["sequence_anomalies"] = data.get("sequence_anomalies", 0) + 1
+        if info.flags & 1:
+            if position + len(info.payload) < data["high_end"]:
                 data["sequence_anomalies"] = data.get("sequence_anomalies", 0) + 1
-            if info.flags & 1:
-                if position + len(info.payload) < data["high_end"]:
-                    data["sequence_anomalies"] = data.get("sequence_anomalies", 0) + 1
-                data["fin_seen"] = True
-                data["fin_offset"] = position + len(info.payload)
-            if info.flags & 4:
-                item["state"] = "reset"
-            elif all(d["fin_seen"] for d in item["directions"].values()):
-                item["state"] = "closed"
-            item["packet_count"] += 1
-            item["updated_at"] = max(now, item["updated_at"])
-            for side in ("", "src_", "dst_"):
-                cid, name = record.get(side + "container_id", ""), record.get(side + "container_name", "")
-                if cid and cid not in item["container_ids"]:
-                    item["container_ids"].append(cid)
-                if name and name not in item["container_names"]:
-                    item["container_names"].append(name)
-            item["container_id"] = item["container_ids"][0] if item["container_ids"] else ""
-            item["container_name"] = item["container_names"][0] if item["container_names"] else ""
-            self._save(item)
-            if record.get("id"):
-                self.db.execute("INSERT INTO seen VALUES(?,?)", (str(record["id"]), item["id"]))
-            # Record IDs only deduplicate a bounded recent window, including duplicate capture paths.
-            self.db.execute("DELETE FROM seen WHERE rowid <= (SELECT MAX(rowid)-65536 FROM seen)")
-            # Retention is needed only when adding a session, not for every packet.
-            expired_rows = (self.db.execute("SELECT id FROM sessions ORDER BY updated_at DESC LIMIT -1 OFFSET ?",
-                                            (self.max_sessions,)).fetchall() if is_new else [])
-            for old in expired_rows:
-                self.db.execute("DELETE FROM sessions WHERE id=?", (old[0],))
-                for path in self.root.glob(old[0] + "-*"):
-                    if path.is_file() and (path.suffix == ".spool" or time.time() - path.stat().st_mtime > 600):
-                        try:
+            data["fin_seen"] = True
+            data["fin_offset"] = position + len(info.payload)
+        if info.flags & 4:
+            item["state"] = "reset"
+        elif all(d["fin_seen"] for d in item["directions"].values()):
+            item["state"] = "closed"
+        item["packet_count"] += 1
+        item["updated_at"] = max(now, item["updated_at"])
+        for side in ("", "src_", "dst_"):
+            cid, name = record.get(side + "container_id", ""), record.get(side + "container_name", "")
+            if cid and cid not in item["container_ids"]:
+                item["container_ids"].append(cid)
+            if name and name not in item["container_names"]:
+                item["container_names"].append(name)
+        item["container_id"] = item["container_ids"][0] if item["container_ids"] else ""
+        item["container_name"] = item["container_names"][0] if item["container_names"] else ""
+        self._batch["flows"][flow] = item
+        self._batch["dirty"][item["id"]] = item
+        if record.get("id"):
+            key = str(record["id"])
+            self._batch["seen"][key] = item["id"]
+            self._batch["new_seen"][key] = item["id"]
+        return item["id"]
+
+    def _trim_batch(self):
+        """Delete metadata transactionally; physical deletion waits for COMMIT."""
+        expired_rows = (self.db.execute("SELECT id FROM sessions ORDER BY updated_at DESC LIMIT -1 OFFSET ?",
+                                        (self.max_sessions,)).fetchall() if self._batch["new_sessions"] else [])
+        victims = [row[0] for row in expired_rows]
+        self.db.executemany("DELETE FROM sessions WHERE id=?", ((sid,) for sid in victims))
+        return victims
+
+    def _cleanup_retired(self, victims, new_sessions):
+        # Called only after a successful commit, with every batch file closed.
+        for session_id in victims:
+            for direction in ("client", "server"):
+                try:
+                    self._spool(session_id, direction).unlink(missing_ok=True)
+                except OSError:
+                    pass  # A download may still hold it; a later sweep retries.
+        if new_sessions and time.monotonic() - self._last_gc > 60:
+            self._last_gc = time.monotonic()
+            retained = {row[0] for row in self.db.execute("SELECT id FROM sessions")}
+            for path in self.root.iterdir():
+                match = re.fullmatch(r"([0-9a-f]{32})-(client|server)(?:-.*\.(?:raw|text|latin1|tmp)|\.spool)", path.name)
+                if match and match[1] not in retained:
+                    try:
+                        if time.time() - path.stat().st_mtime > 600:
                             path.unlink()
-                        except OSError:
-                            pass  # A download may still hold it on Windows.
-            if is_new and time.monotonic() - self._last_gc > 60:
-                self._last_gc = time.monotonic()
-                retained = {row[0] for row in self.db.execute("SELECT id FROM sessions")}
-                for path in self.root.iterdir():
-                    match = re.fullmatch(r"([0-9a-f]{32})-(client|server)-.*\.(raw|text|latin1|tmp)", path.name)
-                    if match and match[1] not in retained and time.time() - path.stat().st_mtime > 600:
-                        try:
-                            path.unlink()
-                        except OSError:
-                            pass
-            return item["id"]
+                    except OSError:
+                        pass
 
     def _describe_direction(self, session_id, direction, data):
         result = {k: v for k, v in data.items() if k not in ("anchor", "high_end", "start_offset", "fin_offset", "revision")}

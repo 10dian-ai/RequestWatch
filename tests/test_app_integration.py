@@ -72,7 +72,7 @@ def test_app_rule_pause_edit_search_and_replay(tmp_path):
         proxy_port = reservation.getsockname()[1]
     token = "app-integration-private-test-token"
     config = Config(host="127.0.0.1", port=management_port, data_dir=tmp_path / "live-app",
-                    token=token, capture_enabled=False, proxy_enabled=True,
+                    token=token, capture_enabled=False, passive_only=False, proxy_enabled=True,
                     proxy_host="127.0.0.1", proxy_port=proxy_port, demo=False)
     app = create_app(config)
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=management_port,

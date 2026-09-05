@@ -64,6 +64,7 @@ class SettingsInput(BaseModel):
     port: Port | None = None
     interfaces: str | list[str] | None = Field(default=None, max_length=2048)
     capture_enabled: bool | None = None
+    passive_only: bool | None = None
     queue_num: Port | None = None
     protected_ports: list[Port] | None = Field(default=None, max_length=1024)
     proxy_enabled: bool | None = None

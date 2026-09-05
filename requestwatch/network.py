@@ -237,11 +237,13 @@ class NetworkEngine:
         self._pending: dict[str, _Pending] = {}
         self._pending_fingerprints: dict[tuple, str] = {}
         self._observations = queue.Queue(maxsize=4096)
+        self._observations_ready = threading.Event()
         self._recent_queue: dict[bytes, float] = {}
         self._patches: OrderedDict[tuple, list[tuple[float, int, bytes, bytes]]] = OrderedDict()
         self._capture_error = self._queue_error = None
         self._capture_running = self._queue_active = False
         self._passive_dropped = 0
+        self._passive_write_failed = 0
         self._chain = f"RWATCH_{int(config.queue_num)}"
         self._comment = f"requestwatch-managed-{int(config.queue_num)}"
         self._retry_at = 0.0
@@ -325,7 +327,14 @@ class NetworkEngine:
                 "capture_error": self._capture_error, "interception_error": self._queue_error,
                 "interfaces": self.config.interfaces, "active_interfaces": list(self._capture_interfaces),
                 "protected_ports": list(self.config.protected_ports), "queue_num": self.config.queue_num,
+                "capture_mode": "passive" if getattr(self.config, "passive_only", False) else "intercept",
+                "passive_only": bool(getattr(self.config, "passive_only", False)),
                 "passive_dropped": self._passive_dropped,
+                "observation_dropped": self._passive_dropped,
+                "observation_write_failed": self._passive_write_failed,
+                "observation_backlog": self._observations.qsize(),
+                "observation_capacity": self._observations.maxsize,
+                "observation_drop_semantics": "capture copies not saved; original network packets are unaffected",
                 "limitations": ["Protected ports are excluded from both passive capture and interception.",
                                 "TCP edits must preserve byte length; DROP is a packet verdict, not request cancellation.",
                                 "TCP retransmission edits use a bounded five-minute cache.",
@@ -379,6 +388,8 @@ class NetworkEngine:
             self._command(binary, "-I", parent, "1", "-m", "comment", "--comment", self._comment, "-j", self._chain)
 
     def _enable_queue(self):
+        if getattr(self.config, "passive_only", False):
+            return
         try:
             factory = self._queue_factory
             if factory is None:
@@ -416,6 +427,8 @@ class NetworkEngine:
             self._queue_error = "; ".join(errors)
 
     def _rules_need_queue(self):
+        if getattr(self.config, "passive_only", False):
+            return False
         return any(rule.get("enabled", True) and rule.get("source", "any") in ("any", "packet")
                    and str(rule.get("protocol", "any")).upper() in ("ANY", "TCP", "UDP")
                    for rule in self.runtime.rules())
@@ -438,13 +451,21 @@ class NetworkEngine:
                         self._disable_queue()
                     next_sync = now + 1
                 if self._nfqueue is not None:
-                    readable, _, _ = select.select([self._nfqueue.get_fd()], [], [], 0.04)
+                    # Backlogged observations must not pay a fixed sleep for
+                    # every batch, while NFQUEUE still gets polled each loop.
+                    timeout = 0.0 if not self._observations.empty() else 0.04
+                    readable, _, _ = select.select([self._nfqueue.get_fd()], [], [], timeout)
                     if readable:
                         self._nfqueue.run(False)
-                else:
-                    self._stop.wait(0.04)
+                elif self._observations.empty():
+                    self._observations_ready.wait(0.04)
+                    self._observations_ready.clear()
                 self._process_decisions()
-                self._flush_passive()
+                processed = self._flush_passive()
+                if not processed and not self._observations.empty():
+                    # A young NFQUEUE copy may still be within its coalescing
+                    # window. Do not spin while waiting for that bounded delay.
+                    self._stop.wait(0.004)
                 self._recent_queue = {key: timestamp for key, timestamp in self._recent_queue.items()
                                       if now - timestamp < 1.0}
         except Exception as exc:
@@ -453,43 +474,114 @@ class NetworkEngine:
             self._disable_queue()
             self._flush_passive(force=True)
 
+    def _ignore_passive(self, raw):
+        """Cheap common-IP checks keep control traffic out of the copy queue.
+
+        Decode neither payload text nor records on the sniffer callback. IPv6
+        extension chains use the existing validated parser as the rare fallback.
+        """
+        if not raw:
+            return True
+        version = raw[0] >> 4
+        if version == 4 and len(raw) >= 20:
+            if raw[9] not in (6, 17):
+                return True
+            if int.from_bytes(raw[6:8], "big") & 0x1fff:
+                return False  # Preserve noninitial fragments, whose ports are unknown.
+            offset = (raw[0] & 15) * 4
+            if offset < 20 or len(raw) < offset + 4:
+                return False  # Worker reports invalid/truncated packet structure.
+        elif version == 6 and len(raw) >= 40 and raw[6] in (6, 17):
+            offset = 40
+            if len(raw) < offset + 4:
+                return False
+        else:
+            try:
+                info = parse_packet(raw)
+                return info.src_port in self.config.protected_ports or info.dst_port in self.config.protected_ports
+            except ValueError:
+                return True
+        source, target = struct.unpack_from("!HH", raw, offset)
+        return source in self.config.protected_ports or target in self.config.protected_ports
+
     def _on_sniff(self, packet):
         try:
             layer = packet.getlayer("IP") or packet.getlayer("IPv6")
             if layer is None:
                 return
-            raw = bytes(layer)
-            info = parse_packet(raw)
-            if info.src_port in self.config.protected_ports or info.dst_port in self.config.protected_ports:
+            # Scapy already retains the received wire bytes. Re-serializing its
+            # dissected protocol tree for every packet adds avoidable CPU work.
+            original = getattr(layer, "original", None)
+            raw = original if isinstance(original, bytes) and original else bytes(layer)
+            if self._ignore_passive(raw):
                 return
             self._observations.put_nowait((time.monotonic(), raw, str(getattr(packet, "sniffed_on", ""))))
+            self._observations_ready.set()
         except queue.Full:
             self._passive_dropped += 1
         except (ValueError, AttributeError):
             return
 
     def _flush_passive(self, force=False):
-        # Coalesce a sniff copy with its authoritative NFQUEUE observation.
-        # Normal batches leave time for interception verdicts. Shutdown must
-        # drain the entire queued snapshot, which can contain 4096 packets.
+        # Pure observation does not wait for, hash, or consult NFQUEUE copies.
+        coalesce = bool(self._queue_active or self._recent_queue)
         budget = self._observations.qsize() if force else 512
+        processed, batch_bytes, batch = 0, 0, []
+
+        def save_batch():
+            nonlocal batch_bytes
+            if not batch:
+                return
+            try:
+                ingest_packets = getattr(self.runtime, "ingest_packets", None)
+                if ingest_packets is not None:
+                    ingest_packets(batch)
+                else:  # Standalone embedders/test doubles preserve the old API.
+                    for record in batch:
+                        self.runtime.ingest(record, can_intercept=False)
+            except Exception:
+                # A malformed item or transient batch failure must not discard
+                # the remaining records. Stable IDs make these retries safe if
+                # another storage stage committed before the batch failed.
+                for record in batch:
+                    try:
+                        self.runtime.ingest(record, can_intercept=False)
+                    except Exception as exc:
+                        self._passive_write_failed += 1
+                        self._capture_error = str(exc)
+            finally:
+                batch.clear()
+                batch_bytes = 0
+
         for _ in range(budget):
             with self._observations.mutex:
                 if not self._observations.queue:
                     break
                 when, raw, interface = self._observations.queue[0]
-            if not force and time.monotonic() - when < 0.12:
+            if coalesce and not force and time.monotonic() - when < 0.12:
                 break
             self._observations.get_nowait()
-            fingerprint = hashlib.blake2s(raw).digest()
-            if abs(self._recent_queue.get(fingerprint, -100) - when) < 0.8:
-                continue
+            processed += 1
+            if coalesce:
+                fingerprint = hashlib.blake2s(raw).digest()
+                if abs(self._recent_queue.get(fingerprint, -100) - when) < 0.8:
+                    continue
             try:
-                self.runtime.ingest(packet_record(raw, interface), can_intercept=False)
-            except Exception as exc:
+                batch.append(packet_record(raw, interface))
+                batch_bytes += len(raw)
+            except (ValueError, TypeError) as exc:
                 self._capture_error = str(exc)
+            # GSO/GRO captures may contain 64KiB IP packets; cap bytes as well
+            # as record count so a batch cannot multiply their transient memory.
+            if len(batch) >= 512 or batch_bytes >= 4 * 1024 * 1024:
+                save_batch()
+        save_batch()
+        return processed
 
     def _on_queued(self, packet):
+        if getattr(self.config, "passive_only", False):
+            packet.accept()
+            return
         retained = False
         try:
             raw = packet.get_payload()

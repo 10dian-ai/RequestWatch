@@ -18,6 +18,7 @@ class Config:
     data_dir: Path = field(default_factory=lambda: Path(os.getenv("RW_DATA_DIR", "data")))
     token: str = field(default_factory=lambda: os.getenv("RW_TOKEN", ""))
     capture_enabled: bool = field(default_factory=lambda: env_bool("RW_CAPTURE", True))
+    passive_only: bool = field(default_factory=lambda: env_bool("RW_PASSIVE_ONLY", True))
     interfaces: str = field(default_factory=lambda: os.getenv("RW_INTERFACES", "any"))
     queue_num: int = field(default_factory=lambda: int(os.getenv("RW_QUEUE_NUM", "7030")))
     protected_ports: tuple[int, ...] = field(default_factory=lambda: tuple(int(p) for p in os.getenv("RW_PROTECTED_PORTS", "22").split(",") if p.strip()))
@@ -81,7 +82,7 @@ class Config:
                     os.unlink(temporary)
 
     def settings_values(self):
-        names = ("host", "port", "capture_enabled", "interfaces", "queue_num", "pending_limit",
+        names = ("host", "port", "capture_enabled", "passive_only", "interfaces", "queue_num", "pending_limit",
                  "max_records", "proxy_enabled", "proxy_host", "proxy_port", "proxy_auth", "token",
                  "default_timeout_seconds", "tcp_idle_timeout", "mitmdump")
         result = {name: getattr(self, name) for name in names}

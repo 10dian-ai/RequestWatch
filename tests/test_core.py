@@ -103,7 +103,7 @@ def test_runtime_single_verdict_timeout_and_capacity(db):
 
 @pytest.fixture
 def client(tmp_path):
-    cfg = Config(data_dir=tmp_path / "app", token=TOKEN, demo=True, capture_enabled=False, proxy_enabled=False)
+    cfg = Config(data_dir=tmp_path / "app", token=TOKEN, demo=True, capture_enabled=False, proxy_enabled=False, passive_only=False)
     with TestClient(create_app(cfg)) as instance:
         instance.headers["Authorization"] = f"Bearer {TOKEN}"
         yield instance

@@ -1,8 +1,21 @@
 # 验证记录
 
-日期：2026-09-05。版本：0.3.1。开发机：Windows，Python 3.14.7；目标部署：Ubuntu 24.04+，Python 3.12+。
+日期：2026-09-05。版本：0.4.0。开发机：Windows，Python 3.14.7；目标部署：Ubuntu 24.04+，Python 3.12+。
 
-## 0.3.1 本次验证
+## 0.4.0 本次验证
+
+- 完整 Python 回归（开启实际 app/mitmdump 集成）：540 passed、9 skipped、4 subtests passed。两个上游依赖弃用警告；跳过的平台/代理环境限制同下。
+- 默认只读：真实 Config 默认 passive_only=True，旧设置升级也默认只读；有旧启用规则仍不调用 NFQUEUE 或安装 iptables 规则。HTTP 代理记录完整保存，但不进入暂停；修改、丢弃、重发接口在只读时拒绝执行。面板可明确关闭只读并应用。
+- 被动采集回调保留原始 IP 字节；工作线程按最多 512 条或约 4 MiB 一批写盘，去掉只读路径的 NFQUEUE 去重等待、哈希与每批固定等待。观察队列满时仅记录副本未保存，未截断任何包以提升速度。
+- 批次持久化：Store.save_many、TCPStreamStore.ingest_many、Runtime.ingest_packets；覆盖同批乱序/重传/重复 ID、超保留上限、原始字节、单批各数据库一次 COMMIT、并发、失败回滚、冲突以及大 GSO 数据包尾部。暂停路径保留逐包决定语义。另覆盖 SQL 淘汰后异常、COMMIT 被拒绝及提交后清理失败，回滚时旧正文与下载仍完整可读。
+- 本机合成保存基准（Windows，同一组 4,000 个 512 B TCP 包、保留上限 1,000）：2.897 秒 → 0.434 秒，约 1,381 → 9,221 包/秒、6.7 倍。原来 8,000 次提交降为 16 次。独立回调微基准为 2.73 倍。这些数据不代表 Ubuntu 实际网卡线速或目标服务器容量。
+- 界面按用户参考改为浅蓝宽行事件列表，粗标题、状态图标和明确的详情按钮。正文 16px/600，代码区提供正确中文无衬线回退；默认正文页并列 HTTP 请求体/响应体，TCP 自动读取关联会话双向正文。头信息和连接完整性折叠，原单包和 HEX 保留为次要页签。
+- Chromium 新 ui-body-workspace：大正文尾部、双向内容、独立自动/原文切换、流式更新、全文查找/下载、只读隐藏操作、空 GET 正文、抽屉关闭及焦点恢复通过；1440px/390px 无页面横向溢出。原 ui-readable、ui-packet-details 及实际服务的完整 ui-smoke（显式关闭只读以验证可选编辑/重发/拦截）通过。
+
+- 7030 真实演示 API 的只读浏览器验证：HTTP 请求/响应正文与完整 API 逐字一致；点击 31 B TCP 包可直接读取同会话客户端 80,114 B、服务端 31 B 全文，末尾标记可见，下载原始字节完全一致。未注入新数据或调用编辑、重发及设置写接口。CDP 确认中文正文实际字体为 Microsoft YaHei UI Bold，英文为 Cascadia Code SemiBold。
+- Python compileall、JavaScript node --check、git diff --check 及 0.4.0 wheel 构建通过；包内版本、完整正文界面、批量保存模块及 AGPL 元数据核对通过。
+
+## 0.3.1 已执行的基础验证
 
 - 冻结全部修改后，完整 Python 回归（RW_RUN_APP_INTEGRATION=1，独立 mitmdump）为 520 passed、9 skipped、4 subtests passed；两个上游依赖弃用警告。代理独立环境另外执行的相关回归 91 passed（包含真实 HTTP/HTTPS；与完整回归有重叠，不相加）。
 - 复现并修复列表 240 字摘要被当成完整单包内容、详情加载失败无限等待；浏览器覆盖延迟成功、详情/刷新失败、重试、保留完整快照、完整 HEX 还原文本、末尾标记、TCP 正确方向与反向入口、ACK 无载荷及会话淘汰。
@@ -59,7 +72,9 @@ RW_RUN_APP_INTEGRATION=1 RW_RUN_PROXY_INTEGRATION=1 .venv/bin/python -m pytest -
 sudo env RW_RUN_LINUX_INTEGRATION=1 .venv/bin/python -m pytest tests/test_linux_integration.py -q
 ```
 
-浏览器脚本：tests/ui-smoke.cjs（完整功能，包含设置）、tests/ui-settings.cjs（仅设置）、tests/ui-readable.cjs（解析及统计界面隔离验证）、tests/ui-packet-details.cjs（单包加载与会话关联）和 tests/ui-readable-live.cjs（真实演示 API 的 SSE/TCP 验证，TCP 场景通过 RW_UI_READABLE_SESSION_ID 指定预先写入的会话 ID）。需要 playwright-core 和 Chromium；RW_BROWSER_PATH 指定浏览器，RW_UI_URL / RW_UI_TOKEN 指定**演示模式**控制台。脚本创建演示记录、规则及模拟设置，不应用于真实服务器。
+只读真实正文检查：tests/ui-body-workspace-live.cjs，使用已有的隔离演示 HTTP/TCP 样本，不创建或修改数据。
+
+浏览器脚本：tests/ui-body-workspace.cjs（宽行列表与默认双正文）、tests/ui-smoke.cjs（完整功能，包含设置）、tests/ui-settings.cjs（仅设置）、tests/ui-readable.cjs（解析及统计界面隔离验证）、tests/ui-packet-details.cjs（单包加载与会话关联）和 tests/ui-readable-live.cjs（真实演示 API 的 SSE/TCP 验证，TCP 场景通过 RW_UI_READABLE_SESSION_ID 指定预先写入的会话 ID）。需要 playwright-core 和 Chromium；RW_BROWSER_PATH 指定浏览器，RW_UI_URL / RW_UI_TOKEN 指定**演示模式**控制台。脚本创建演示记录、规则及模拟设置，不应用于真实服务器。
 
 ## 发布
 

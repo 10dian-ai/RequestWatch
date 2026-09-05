@@ -162,7 +162,7 @@ def create_app(config: Config | None = None) -> FastAPI:
     @api.get("/status")
     def status():
         demo_status = {"running": False, "state": "demo", "detail": "演示模式，不操作真实网络"}
-        return {"mode": "demo" if config.demo else "live", "port": config.port, "proxy_port": config.proxy_port,
+        return {"mode": "demo" if config.demo else "live", "passive_only": config.passive_only, "port": config.port, "proxy_port": config.proxy_port,
                 "proxy_host": config.proxy_host, "capture": demo_status if config.demo else network.status(),
                 "proxy": demo_status if config.demo else proxy.status(), "docker": demo_status if config.demo else inventory.status(),
                 "stats": store.stats(), "protected_ports": config.protected_ports, "max_records": config.max_records,
@@ -258,6 +258,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                         "instance_id": instance_id, "next": {"host": values["host"], "port": values["port"],
                         "token_changed": values["token"] != current_settings["token"]}}
             if config.demo:
+                config.passive_only = values["passive_only"]
                 current_settings = values
                 return response
             restart_scheduled = True
@@ -525,6 +526,8 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     @api.post("/records/{record_id}/decision")
     def decision(record_id: str, body: DecisionInput):
+        if config.passive_only:
+            raise HTTPException(409, "当前为只读观察模式，不暂停、修改或发送流量")
         record = get_record(record_id)
         edits = body.edits if body.action == "accept" else {}
         try:
@@ -545,6 +548,8 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     @api.post("/records/{record_id}/replay")
     def replay(record_id: str, body: ReplayInput):
+        if config.passive_only:
+            raise HTTPException(409, "当前为只读观察模式，不暂停、修改或发送流量")
         record = get_record(record_id)
         if record["state"] in {"pending", "resolving"}:
             raise HTTPException(409, "请先处理原请求的拦截，再进行重发")

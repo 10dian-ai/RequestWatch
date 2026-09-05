@@ -80,6 +80,7 @@ const { chromium } = require(process.env.RW_PLAYWRIGHT_MODULE || 'playwright-cor
     await page.locator('#edit-button').click();
     assert.equal(await page.locator('#edit-body').inputValue(), requestRaw, 'editor must use original request, never parsed text');
     await page.locator('#edit-button').click();
+    await page.locator('#close-detail').click();
     await page.locator('.navigation [data-view="sessions"]').click();
     await page.locator('#sessions-body tr').first().click();
     await page.locator('#session-content .readable-body').waitFor();
