@@ -15,7 +15,7 @@ import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from fastapi import BackgroundTasks, APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
@@ -28,6 +28,7 @@ from .rules import RuleInput
 from .runtime import Runtime
 from .store import Store
 from .settings import SettingsError, public_settings
+from .readable_cache import ReadableCache
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,7 @@ def create_app(config: Config | None = None) -> FastAPI:
     inventory = DockerInventory()
     runtime = Runtime(store, config, inventory if not config.demo else None, streams)
     network, proxy = NetworkEngine(runtime, config), ProxyProcess(config)
+    readable = ReadableCache(store.bodies.root.parent)
     stop = threading.Event()
     maintenance_thread = None
 
@@ -67,6 +69,7 @@ def create_app(config: Config | None = None) -> FastAPI:
             if ticks % 60 == 0:
                 try:
                     store.gc_bodies()
+                    readable.gc()
                 except Exception:
                     logger.exception("Body retention cleanup failed")
             if config.demo:
@@ -302,6 +305,48 @@ def create_app(config: Config | None = None) -> FastAPI:
             headers["Content-Disposition"] = 'attachment; filename="' + filename + '"'
         return Response(value, media_type=media, headers=headers)
 
+    def readable_links(meta, route):
+        result = dict(meta)
+        result["content_url"] = route + "/content?revision=" + result["revision"]
+        result["download_url"] = result["content_url"] + "&download=true"
+        return result
+
+    def cached_content(owner, revision, download):
+        try:
+            meta, path = readable.get(owner, revision)
+        except (OSError, ValueError) as exc:
+            raise HTTPException(410, "解析快照已过期，请重新读取内容") from exc
+        return FileResponse(path, media_type="text/plain; charset=utf-8",
+                            filename="requestwatch-readable.txt" if download else None,
+                            headers={"X-Body-Complete": str(bool(meta.get("complete"))).lower()})
+
+    @api.get("/records/{record_id}/readable/{side}")
+    def record_readable(record_id: str, side: Literal["request", "response"]):
+        record = get_record(record_id)
+        body_available(record, side)
+        headers = {str(k).lower(): str(v) for k, v in record.get(side + "_headers", [])}
+        content_type = headers.get("content-type", "")
+        options = {"content_type": content_type, "content_encoding": headers.get("content-encoding", ""),
+                   "source_complete": not record.get(side + "_truncated") and record.get(side + "_body_complete", True)}
+        try:
+            # Proxy bodies are already dechunked. Prefer its complete charset-decoded
+            # text, which also supports encodings outside the TCP parser's vocabulary.
+            if record.get(side + "_text_ref") and not record.get(side + "_body_binary") and not record.get(side + "_body_decode_error"):
+                path = store.bodies.path(record[side + "_text_ref"])
+                options.update(content_type=content_type.split(";")[0] + "; charset=utf-8", content_encoding="")
+            else:
+                ref = record.get(side + "_body_ref") or store.bodies.put(store.bodies.read_body(record, side))
+                path = store.bodies.path(ref)
+            meta = readable.build("record:" + record_id + ":" + side, path, **options)
+        except (OSError, ValueError) as exc:
+            raise HTTPException(410, "正文不可读取或无法生成解析视图，请检查原文") from exc
+        return readable_links(meta, "/api/records/" + quote(record_id, safe="") + "/readable/" + side)
+
+    @api.get("/records/{record_id}/readable/{side}/content")
+    def record_readable_content(record_id: str, side: Literal["request", "response"], revision: str, download: bool = False):
+        get_record(record_id)
+        return cached_content("record:" + record_id + ":" + side, revision, download)
+
     @api.get("/records/{record_id}/message/{side}")
     def full_http_message(record_id: str, side: Literal["request", "response"]):
         record = get_record(record_id)
@@ -365,6 +410,23 @@ def create_app(config: Config | None = None) -> FastAPI:
         return FileResponse(path, media_type="application/octet-stream" if view == "raw" else "text/plain; charset=utf-8",
                             filename=("requestwatch-tcp-" + direction + (".bin" if view == "raw" else ".txt")) if download else None,
                             headers={"X-Body-Complete": str(bool(session.get("complete"))).lower()})
+
+    @api.get("/sessions/{session_id}/readable/{direction}")
+    def session_readable(session_id: str, direction: Literal["client", "server"]):
+        get_session(session_id)
+        try:
+            path, data = streams.body_path(session_id, direction, "raw", with_metadata=True)
+            meta = readable.build("session:" + session_id + ":" + direction, path,
+                                  has_gaps=any(data.get(key, 0) for key in ("gap_count", "overlap_conflicts", "sequence_anomalies", "fragmented_packets", "truncated_packets")),
+                                  source_complete=bool(data["complete"]))
+        except (OSError, ValueError, KeyError) as exc:
+            raise HTTPException(410, "会话不可读取或无法生成解析视图，请检查原文") from exc
+        return readable_links(meta, "/api/sessions/" + session_id + "/readable/" + direction)
+
+    @api.get("/sessions/{session_id}/readable/{direction}/content")
+    def session_readable_content(session_id: str, direction: Literal["client", "server"], revision: str, download: bool = False):
+        get_session(session_id)
+        return cached_content("session:" + session_id + ":" + direction, revision, download)
 
     @api.get("/containers")
     def containers():

@@ -31,7 +31,7 @@ const {chromium} = require(process.env.RW_PLAYWRIGHT_MODULE || 'playwright-core'
   await page.locator('#confirm-ok').click();
   await page.waitForFunction(() => document.querySelector('#detail-state').textContent.includes('已重发'));
   await page.locator('[data-tab="request"]').click();
-  assert((await page.locator('#detail-body').textContent()).includes('界面草稿保留验证'));
+  await page.waitForFunction(() => document.querySelector('#detail-body .full-body')?.textContent.includes('界面草稿保留验证'));
   await page.locator('.navigation [data-view="rules"]').click();
   await page.locator('#new-rule').click();
   await page.locator('#rule-name').fill('UI 验证 · 待审请求');
@@ -48,7 +48,7 @@ const {chromium} = require(process.env.RW_PLAYWRIGHT_MODULE || 'playwright-core'
   await page.locator('#accept-button').click();
   await page.waitForFunction(() => document.querySelector('#detail-state').textContent.includes('已放行'));
   await page.locator('[data-tab="request"]').click();
-  assert((await page.locator('#detail-body').textContent()).includes('UI 已批准'));
+  await page.waitForFunction(() => document.querySelector('#detail-body .full-body')?.textContent.includes('UI 已批准'));
   await page.locator('.navigation [data-view="rules"]').click();
   await page.locator('#generate-demo-request').click();
   await page.locator('#pending-actions:not([hidden])').waitFor();
@@ -84,13 +84,14 @@ const {chromium} = require(process.env.RW_PLAYWRIGHT_MODULE || 'playwright-core'
   await page.route(unavailableBody, route => route.fulfill({status: 503, contentType: 'application/json', body: JSON.stringify({detail: 'UI fixture: temporary body read failure'})}));
   await page.locator(`#records-body tr[data-id="${recordId}"]`).click();
   await page.locator('[data-tab="request"]').click();
+  await page.locator('#http-body-format').selectOption('text');
   await page.waitForFunction(() => document.querySelector('#detail-body').textContent.includes('完整正文加载失败'));
   assert(await page.locator('#edit-button').isDisabled(), 'Failed complete-body load must not allow preview-only editing');
   await page.unroute(unavailableBody);
   await page.locator('#detail-body').getByRole('button', {name: '重新读取'}).click();
   await page.waitForFunction(tail => document.querySelector('#detail-body .full-body')?.textContent.endsWith(tail), requestTail);
   assert.equal(await page.locator('#detail-body .full-body').textContent(), fullRequest);
-  assert((await page.locator('#detail-body').textContent()).includes('已载入完整正文'));
+  assert((await page.locator('#detail-body').textContent()).includes('原始正文完整保存'));
   const fullBodyNode = await page.locator('#detail-body .full-body').elementHandle();
   const readingOffset = await fullBodyNode.evaluate(node => { node.scrollTop = node.scrollHeight; return node.scrollTop; });
   await page.waitForTimeout(2300);
@@ -143,6 +144,7 @@ const {chromium} = require(process.env.RW_PLAYWRIGHT_MODULE || 'playwright-core'
     await page.locator('#session-query').fill(process.env.RW_UI_SESSION_MARKER || clientText.slice(-24));
     await page.locator(`#sessions-body tr[data-id="${sessionId}"]`).waitFor();
     await page.locator(`#sessions-body tr[data-id="${sessionId}"]`).click();
+    await page.locator('#session-format').selectOption('text');
     await page.waitForFunction(tail => document.querySelector('#session-content .session-full-body')?.textContent.endsWith(tail), clientText.slice(-24));
     assert.equal(await page.locator('#session-content .session-full-body').textContent(), clientText);
     await page.locator('[data-session-side="server"]').click();

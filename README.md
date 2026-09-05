@@ -152,6 +152,14 @@ services:
 
 响应正文支持搜索，但**请求发送前的暂停规则不能匹配未来尚未收到的响应**。TCP 会话搜索会跨包匹配，原始包暂停规则仍逐包匹配；通用 TCP 连接没有统一的“请求结束”定义。需要在完整 HTTP 请求发送前编辑时，使用 HTTP/HTTPS 代理路径。
 
+### 统计与可读内容
+
+首页「累计捕获」持续增加，「当前保留」受设置中的保留上限约束。达到默认 10000 条后，新记录替换旧记录，保留数会保持不变；最近捕获时间和累计数用于判断是否仍有流量。更新旧版本时以现存记录作为累计基线，先前已淘汰的数量无法追溯，页面会明确说明。
+
+HTTP 正文与 TCP 会话默认使用「自动解析」：识别 HTTP/1 分块、gzip/deflate、JSON 与 SSE 流式事件，将常见聊天增量拼接成正文，单独显示思考字段，同时保留完整事件明细。换行与 Unicode 转义会被解码，不再把分块长度当正文显示。可以切回原文、HEX，并分别下载解析文本或原始字节。
+
+解析是对已捕获内容的辅助视图，原始数据不会被替换。没有 HTTP 头时仅在结构匹配时推断分块格式并标记不完整；缺口、截断或重传冲突不跨片段拼接；TLS 密文不会被伪装成明文。超过单事件 JSON 解析预算时完整保留事件文本并提示，不截断文件。没有配对请求上下文的 HEAD/CONNECT 响应边界无法保证判断，需以原文或 HTTP 代理记录核对。
+
 ### 完整内容如何保存
 
 - HTTP/HTTPS 原始正文和解码全文按内容哈希保存到 `body_blobs/`，取消旧版每项 1 MiB 的截断。数据库只保留 64 KiB 预览，详情页自动加载全文，编辑和重发使用完整文件；二进制上传、压缩正文保留原始字节。
@@ -240,6 +248,7 @@ sudo env RW_QUEUE_NUM=7030 python3 /opt/requestwatch/scripts/cleanup_firewall.py
 - requestwatch/runtime.py / store.py / rules.py：拦截生命周期、SQLite、组合规则
 - requestwatch/network.py：被动捕获与 NFQUEUE
 - requestwatch/body_store.py：完整HTTP正文文件
+- requestwatch/stream_decode.py / readable_cache.py：HTTP/JSON/SSE 可读解析与临时快照
 - requestwatch/settings.py：面板设置校验、脱敏及原子保存
 - requestwatch/tcp_streams.py：持久化TCP双向序列重组及全文搜索
 - requestwatch/dockerinfo.py：Docker 容器归属

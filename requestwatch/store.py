@@ -37,7 +37,15 @@ class Store:
                 CREATE INDEX IF NOT EXISTS records_time ON records(created_at DESC);
                 CREATE INDEX IF NOT EXISTS records_filter ON records(state, source, protocol, container_id);
                 CREATE TABLE IF NOT EXISTS rules (id TEXT PRIMARY KEY, created_at REAL NOT NULL, data TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS capture_metrics (
+                    id INTEGER PRIMARY KEY CHECK(id=1), captured_total INTEGER NOT NULL,
+                    evicted_total INTEGER NOT NULL, started_at REAL NOT NULL,
+                    baseline INTEGER NOT NULL, last_capture_at REAL, last_activity_at REAL
+                );
             """)
+            # Older versions kept only the retained count; never invent the missing history.
+            self.db.execute("""INSERT OR IGNORE INTO capture_metrics
+                SELECT 1,COUNT(*),0,?,COUNT(*),MAX(created_at),MAX(created_at) FROM records""", (time.time(),))
             # Kernel queues and mitmproxy flow objects cannot survive an application restart.
             for row in self.db.execute("SELECT id, data FROM records WHERE state IN ('pending','resolving')").fetchall():
                 record = json.loads(row["data"])
@@ -51,16 +59,22 @@ class Store:
         record.setdefault("state", "captured")
         record.setdefault("container_id", "")
         with self.lock, self.db:
+            is_new = self.db.execute("SELECT 1 FROM records WHERE id=?", (record["id"],)).fetchone() is None
             self.db.execute("""INSERT INTO records VALUES (?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET created_at=excluded.created_at,
                 source=excluded.source,protocol=excluded.protocol,state=excluded.state,
                 container_id=excluded.container_id,search_text=excluded.search_text,data=excluded.data""",
                 (record["id"], record["created_at"], record.get("source", "packet"), record.get("protocol", "TCP"),
                  record["state"], record["container_id"], searchable(record), json.dumps(record, ensure_ascii=False)))
+            now = time.time()
+            self.db.execute("UPDATE capture_metrics SET captured_total=captured_total+?, "
+                            "last_capture_at=CASE WHEN ? THEN ? ELSE last_capture_at END,last_activity_at=? WHERE id=1",
+                            (int(is_new), int(is_new), now, now))
             # Keep pending decisions reviewable; completed records are evicted oldest first.
             excess = self.db.execute("SELECT MAX(COUNT(*)-?,0) FROM records", (self.max_records,)).fetchone()[0]
             if excess:
-                self.db.execute("DELETE FROM records WHERE id IN (SELECT id FROM records WHERE state NOT IN ('pending','resolving') ORDER BY created_at ASC LIMIT ?)", (excess,))
+                evicted = self.db.execute("DELETE FROM records WHERE id IN (SELECT id FROM records WHERE state NOT IN ('pending','resolving') ORDER BY created_at ASC LIMIT ?)", (excess,)).rowcount
+                self.db.execute("UPDATE capture_metrics SET evicted_total=evicted_total+? WHERE id=1", (evicted,))
         return record
 
     def get(self, record_id: str) -> dict | None:
@@ -131,7 +145,14 @@ class Store:
     def stats(self) -> dict:
         with self.lock:
             row = self.db.execute("SELECT COUNT(*),COALESCE(SUM(state IN ('pending','resolving')),0),COALESCE(SUM(source='http'),0),COALESCE(SUM(source='packet'),0) FROM records").fetchone()
-        return dict(zip(("total", "pending", "http", "packets"), row))
+            metrics = self.db.execute("SELECT * FROM capture_metrics WHERE id=1").fetchone()
+        result = dict(zip(("total", "pending", "http", "packets"), row))
+        result.update(retained=result["total"], captured_total=metrics["captured_total"],
+                      evicted_total=metrics["evicted_total"], counter_started_at=metrics["started_at"],
+                      counter_baseline=metrics["baseline"], last_capture_at=metrics["last_capture_at"],
+                      last_activity_at=metrics["last_activity_at"],
+                      history_before_counter_unknown=metrics["baseline"] > 0)
+        return result
 
     def rules(self) -> list[dict]:
         with self.lock:

@@ -376,7 +376,7 @@ class TCPStreamStore:
         items = [item for sid in ids if (item := self.get(sid)) is not None]
         return {"items": items, "total": total - (len(ids) - len(items))}
 
-    def body_path(self, session_id, direction, view="raw"):
+    def body_path(self, session_id, direction, view="raw", *, with_metadata=False):
         if not re.fullmatch(r"[0-9a-f]{32}", session_id or "") or direction not in ("client", "server"):
             raise ValueError("Invalid TCP session or direction")
         if view not in ("raw", "text", "latin1"):
@@ -387,10 +387,11 @@ class TCPStreamStore:
                 raise KeyError(session_id)
             data = json.loads(row[0])["directions"][direction]
             revision = data["revision"]
+            snapshot_metadata = self._describe_direction(session_id, direction, data) if with_metadata else None
             path = self.root / f"{session_id}-{direction}-{revision}.{view}"
             if path.exists():
                 path.touch()  # Extend the download grace period before handing the path to the API.
-                return path
+                return (path, snapshot_metadata) if with_metadata else path
             rows = self._range_snapshot(session_id, direction)
         # Snapshot revision and ranges are immutable even while capture appends data.
         # Export the snapshot without blocking ingest or substituting a newer revision.
@@ -423,7 +424,7 @@ class TCPStreamStore:
                 temporary.unlink()
             except FileNotFoundError:
                 pass
-        return path
+        return (path, snapshot_metadata) if with_metadata else path
 
     def close(self):
         with self.lock:
