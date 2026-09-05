@@ -67,8 +67,19 @@ class Runtime:
         with self._lock:
             return len(self._pending)
 
+    def expire_http(self, age_seconds: float = 120) -> int:
+        with self._lock:
+            expired = self.store.expire_http(age_seconds)
+            for record_id in expired:
+                self._pending.pop(record_id, None)
+            return len(expired)
+
     def resolve(self, record_id: str, action: str, edits: dict):
         with self._lock:
+            record = self.store.get(record_id)
+            if not record or record.get("state") not in {"pending", "resolving"}:
+                self._pending.pop(record_id, None)
+                raise ValueError("此请求已处理或已失效，请刷新列表")
             entry = self._pending.get(record_id)
             if not entry or entry["decision"] is not None:
                 raise ValueError("此请求已处理或已失效，请刷新列表")
@@ -79,6 +90,10 @@ class Runtime:
 
     def take_decision(self, record_id: str):
         with self._lock:
+            record = self.store.get(record_id)
+            if not record or record.get("state") not in {"pending", "resolving"}:
+                self._pending.pop(record_id, None)
+                return None
             entry = self._pending.get(record_id)
             if not entry:
                 return None

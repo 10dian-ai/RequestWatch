@@ -47,9 +47,13 @@ class Store:
             self.db.execute("""INSERT OR IGNORE INTO capture_metrics
                 SELECT 1,COUNT(*),0,?,COUNT(*),MAX(created_at),MAX(created_at) FROM records""", (time.time(),))
             # Kernel queues and mitmproxy flow objects cannot survive an application restart.
-            for row in self.db.execute("SELECT id, data FROM records WHERE state IN ('pending','resolving')").fetchall():
+            for row in self.db.execute("SELECT id, data FROM records WHERE state IN ('pending','resolving') OR json_extract(data,'$.http_in_flight')=1").fetchall():
                 record = json.loads(row["data"])
-                record.update(state="error", error="服务重启，原拦截对象已失效，无法再放行或丢弃")
+                if record.get("http_in_flight"):
+                    record.update(http_in_flight=False, response_streaming=False, response_body_complete=False,
+                                  response_truncated=True, response_body_error="服务重启，响应未完成；保留重启前已保存的内容")
+                message = "服务重启，原拦截对象已失效，无法再放行或丢弃" if record["state"] in {"pending", "resolving"} else "服务重启，原连接已结束；响应仅包含已保存部分"
+                record.update(state="error", error=message)
                 self.db.execute("UPDATE records SET state='error',data=? WHERE id=?", (json.dumps(record, ensure_ascii=False), row["id"]))
 
     def save(self, record: dict) -> dict:
@@ -59,6 +63,8 @@ class Store:
         record.setdefault("state", "captured")
         record.setdefault("container_id", "")
         with self.lock, self.db:
+            if record.get("source") == "http" and record.get("http_in_flight"):
+                record["http_activity_at"] = time.time()
             is_new = self.db.execute("SELECT 1 FROM records WHERE id=?", (record["id"],)).fetchone() is None
             self.db.execute("""INSERT INTO records VALUES (?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET created_at=excluded.created_at,
@@ -70,12 +76,51 @@ class Store:
             self.db.execute("UPDATE capture_metrics SET captured_total=captured_total+?, "
                             "last_capture_at=CASE WHEN ? THEN ? ELSE last_capture_at END,last_activity_at=? WHERE id=1",
                             (int(is_new), int(is_new), now, now))
-            # Keep pending decisions reviewable; completed records are evicted oldest first.
+            # Keep pending decisions and unfinished HTTP responses; packet traffic must
+            # not evict a long-lived response before its final body can be saved.
             excess = self.db.execute("SELECT MAX(COUNT(*)-?,0) FROM records", (self.max_records,)).fetchone()[0]
             if excess:
-                evicted = self.db.execute("DELETE FROM records WHERE id IN (SELECT id FROM records WHERE state NOT IN ('pending','resolving') ORDER BY created_at ASC LIMIT ?)", (excess,)).rowcount
+                evicted = self.db.execute("DELETE FROM records WHERE id IN (SELECT id FROM records WHERE state NOT IN ('pending','resolving') AND NOT (source='http' AND COALESCE(json_extract(data,'$.http_in_flight'),0)=1) ORDER BY created_at ASC LIMIT ?)", (excess,)).rowcount
                 self.db.execute("UPDATE capture_metrics SET evicted_total=evicted_total+? WHERE id=1", (evicted,))
         return record
+
+    def touch_http(self, record_ids: list[str]) -> int:
+        """Renew active capture leases without reviving completed HTTP records."""
+        ids = list(dict.fromkeys(record_ids))
+        if not ids:
+            return 0
+        touched, now = 0, time.time()
+        with self.lock, self.db:
+            for start in range(0, len(ids), 250):
+                batch = ids[start:start + 250]
+                cursor = self.db.execute(
+                    "UPDATE records SET data=json_set(data,'$.http_activity_at',?) "
+                    "WHERE source='http' AND json_extract(data,'$.http_in_flight')=1 "
+                    "AND id IN (" + ",".join("?" for _ in batch) + ")", (now, *batch))
+                touched += cursor.rowcount
+        return touched
+
+    def expire_http(self, age_seconds: float = 120) -> list[str]:
+        """Release leases from a disconnected capture agent, preserving every blob.
+
+        Return the IDs actually changed so Runtime can invalidate pending decisions
+        under its own lock. Heartbeats only renew active leases, so neither a late
+        heartbeat nor this housekeeping operation can resurrect a terminal state.
+        """
+        if age_seconds < 0:
+            raise ValueError("HTTP lease age cannot be negative")
+        message = "采集代理失联，响应未确认完成；已保留最后收到的内容"
+        with self.lock, self.db:
+            cursor = self.db.execute(
+                "UPDATE records SET state='error', "
+                "data=json_set(data,'$.state','error','$.error',?, "
+                "'$.http_in_flight',json('false'),'$.response_streaming',json('false'), "
+                "'$.response_body_complete',json('false'),'$.response_truncated',json('true'), "
+                "'$.response_body_error',?) "
+                "WHERE source='http' AND json_extract(data,'$.http_in_flight')=1 "
+                "AND COALESCE(json_extract(data,'$.http_activity_at'),created_at)<=? RETURNING id",
+                (message, message, time.time()-age_seconds))
+            return [row[0] for row in cursor.fetchall()]
 
     def get(self, record_id: str) -> dict | None:
         with self.lock:
@@ -138,6 +183,8 @@ class Store:
             # List responses must remain small even when bodies contain megabytes.
             for key in ("raw_b64", "request_body_b64", "response_body_b64", "payload_hex", "request_headers", "response_headers", "request_body_text", "response_body_text"):
                 item.pop(key, None)
+            item["detail_level"] = "summary"
+            item["payload_preview_truncated"] = len(item.get("payload_text", "")) > 240
             item["payload_text"] = item.get("payload_text", "")[:240]
             items.append(item)
         return {"items": items, "total": total}

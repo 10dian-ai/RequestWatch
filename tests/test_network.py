@@ -442,3 +442,47 @@ class NetworkQueueTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_shutdown_drains_more_than_a_normal_batch_after_stopping_producer():
+    worker = engine(FakeRuntime(intercept=False))
+    raw = make_packet(b"last captured bytes")
+    events = []
+    for _ in range(700):
+        worker._observations.put((0, raw, "eth0"))
+
+    class Sniffer:
+        running = True
+
+        def stop(self):
+            events.append("sniffer stopped")
+            self.running = False
+            worker._observations.put((0, raw, "eth0"))
+
+    class Thread:
+        def join(self, timeout):
+            assert not worker._sniffer.running
+            events.append("worker joined")
+            worker._flush_passive(force=True)
+            assert worker._observations.empty()
+
+        def is_alive(self):
+            return False
+
+    worker._sniffer, worker._thread = Sniffer(), Thread()
+    worker.stop()
+    assert events == ["sniffer stopped", "worker joined"]
+    assert worker._observations.empty()
+    assert len(worker.runtime.records) == 701
+
+
+def test_normal_passive_flush_keeps_its_verdict_fairness_budget():
+    worker = engine(FakeRuntime(intercept=False))
+    raw = make_packet()
+    for _ in range(700):
+        worker._observations.put((0, raw, "eth0"))
+    worker._flush_passive()
+    assert len(worker.runtime.records) == 512
+    assert worker._observations.qsize() == 188
+    worker._flush_passive(force=True)
+    assert len(worker.runtime.records) == 700

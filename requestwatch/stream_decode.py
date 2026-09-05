@@ -14,7 +14,7 @@ import re
 import tempfile
 import zlib
 
-DECODER_VERSION = 1
+DECODER_VERSION = 2
 BLOCK = 64 * 1024
 JSON_BUDGET = 4 * 1024 * 1024
 HEADER_BUDGET = 256 * 1024
@@ -146,11 +146,22 @@ def _to_utf8(source, destination, content_type, meta):
                     _warning(meta, "内容包含二进制控制字节，无法自动作为文本解析；请查看原始数据或 HEX")
                     return False
                 output.write(text)
-            output.write(decoder.decode(b"", final=True))
+            if not meta["complete"] and decoder.getstate()[0]:
+                _warning(meta, "末尾字符仍在接收，当前显示已完整解码的文本；未完整字符的原始字节仍保留")
+            output.write(decoder.decode(b"", final=meta["complete"]))
         return True
     except (UnicodeError, LookupError):
         _warning(meta, "内容不是有效的声明字符集文本，可能是二进制、加密数据或缺失的字符片段；请查看原始数据或 HEX")
         return False
+
+
+def _unique_json_pairs(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate JSON keys must retain their original representation")
+        result[key] = value
+    return result
 
 
 def _safe_text(text):
@@ -210,7 +221,7 @@ def _sse(source, output, work, meta):
             detail_out.write("[DONE]\n")
             return
         try:
-            parsed = json.loads(payload)
+            parsed = json.loads(payload, object_pairs_hook=_unique_json_pairs)
         except (ValueError, RecursionError):
             detail_out.write(payload+"\n")
             return
@@ -295,7 +306,7 @@ def _body(source, output, work, meta, content_type="", content_encoding=""):
     if "json" in content_type.lower() or stripped.startswith(("{", "[")):
         if text_path.stat().st_size <= JSON_BUDGET:
             try:
-                value = json.loads(text_path.read_text("utf-8"))
+                value = json.loads(text_path.read_text("utf-8"), object_pairs_hook=_unique_json_pairs)
             except (ValueError, RecursionError):
                 _warning(meta, "JSON 尚未完整或格式无效，已保留全部文本")
             else:

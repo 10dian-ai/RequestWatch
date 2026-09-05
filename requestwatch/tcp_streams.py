@@ -170,7 +170,15 @@ class TCPStreamStore:
                 closed_reuse = False
                 if item["state"] in ("closed", "reset") and info.payload and data["anchor"] is not None:
                     incoming = self._position(info.sequence, data)
-                    closed_reuse = (incoming < (data["start_offset"] or 0)
+                    lower_bound = data["start_offset"]
+                    if lower_bound is None:
+                        # Midstream/out-of-order capture may extend before the
+                        # initial anchor. Those negative offsets are still part
+                        # of this connection, including late retransmissions.
+                        lower_bound = self.db.execute(
+                            "SELECT MIN(start) FROM ranges WHERE session_id=? AND direction=?",
+                            (item["id"], direction)).fetchone()[0]
+                    closed_reuse = (incoming < (lower_bound if lower_bound is not None else 0)
                                     or (data["fin_offset"] is not None
                                         and incoming + len(info.payload) > data["fin_offset"])
                                     or (item["state"] == "reset"
@@ -290,6 +298,18 @@ class TCPStreamStore:
                                     and not data.get("sequence_anomalies", 0)))
         return result
 
+    def session_id_for_record(self, record_id):
+        """Resolve an exact recent observation without confusing reused TCP tuples.
+
+        The bounded deduplication index can expire independently of a retained
+        record. A missing entry must stay unknown, never guess from IP/ports.
+        """
+        if not isinstance(record_id, str) or not record_id:
+            return None
+        with self.lock:
+            row = self.db.execute("SELECT session_id FROM seen WHERE record_id=?", (record_id,)).fetchone()
+            return row[0] if row else None
+
     def get(self, session_id):
         with self.lock:
             row = self.db.execute("SELECT data FROM sessions WHERE id=?", (session_id,)).fetchone()
@@ -388,7 +408,10 @@ class TCPStreamStore:
             data = json.loads(row[0])["directions"][direction]
             revision = data["revision"]
             snapshot_metadata = self._describe_direction(session_id, direction, data) if with_metadata else None
-            path = self.root / f"{session_id}-{direction}-{revision}.{view}"
+            # Invalidate older UTF-8 exports which could decode a character
+            # across a missing sequence range.
+            suffix = "-utf8-v2" if view == "text" else ""
+            path = self.root / f"{session_id}-{direction}-{revision}{suffix}.{view}"
             if path.exists():
                 path.touch()  # Extend the download grace period before handing the path to the API.
                 return (path, snapshot_metadata) if with_metadata else path
@@ -396,10 +419,17 @@ class TCPStreamStore:
         # Snapshot revision and ranges are immutable even while capture appends data.
         # Export the snapshot without blocking ingest or substituting a newer revision.
         temporary = self.root / f"{session_id}-{direction}-{uuid.uuid4().hex}.tmp"
-        decoder = codecs.getincrementaldecoder("utf-8" if view == "text" else "latin-1")(errors="replace")
+        decoder_factory = codecs.getincrementaldecoder("utf-8" if view == "text" else "latin-1")
+        decoder = decoder_factory(errors="replace")
         try:
             with temporary.open("xb") as output:
-                for chunk in self._read_chunks(self._spool(session_id, direction), rows):
+                for chunk in self._read_chunks(self._spool(session_id, direction), rows, gap_events=view == "text"):
+                    if chunk is None:
+                        # A missing byte range cannot join two partial UTF-8
+                        # sequences into a character that was never captured.
+                        output.write(decoder.decode(b"", final=True).encode("utf-8"))
+                        decoder = decoder_factory(errors="replace")
+                        continue
                     output.write(chunk if view == "raw" else decoder.decode(chunk).encode("utf-8"))
                 if view != "raw":
                     output.write(decoder.decode(b"", final=True).encode("utf-8"))

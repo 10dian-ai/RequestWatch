@@ -39,6 +39,11 @@ class DecisionInput(BaseModel):
     edits: dict = Field(default_factory=dict)
 
 
+class HeartbeatInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    record_ids: list[str] = Field(max_length=500)
+
+
 class ReplayInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     edits: dict = Field(default_factory=dict)
@@ -66,6 +71,11 @@ def create_app(config: Config | None = None) -> FastAPI:
         ticks = 0
         while not stop.wait(1):
             ticks += 1
+            if ticks % 5 == 0:
+                try:
+                    runtime.expire_http()
+                except Exception:
+                    logger.exception("HTTP capture heartbeat cleanup failed")
             if ticks % 60 == 0:
                 try:
                     store.gc_bodies()
@@ -270,7 +280,27 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     @api.get("/records/{record_id}")
     def record_detail(record_id: str):
-        return get_record(record_id)
+        record = get_record(record_id)
+        record["detail_level"] = "full"
+        if record.get("source") == "packet" and record.get("protocol") == "TCP":
+            session_id = record.get("tcp_session_id") or streams.session_id_for_record(record_id)
+            session = streams.get(session_id) if session_id else None
+            record["tcp_session_available"] = session is not None
+            if session_id:
+                record["tcp_session_id"] = session_id
+            if session:
+                source = (record.get("src_ip"), record.get("src_port"))
+                for side in ("client", "server"):
+                    if source == (session[side + "_ip"], session[side + "_port"]):
+                        record["tcp_session_direction"] = side
+                        break
+            else:
+                record["tcp_session_unavailable_reason"] = (
+                    "关联的 TCP 会话已超过保留数量，无法恢复未保留的内容" if session_id else
+                    "未找到此包的准确会话关联；旧版本记录或会话采集失败可能没有关联")
+                if record.get("tcp_session_error"):
+                    record["tcp_session_unavailable_reason"] += "：" + str(record["tcp_session_error"])
+        return record
 
     @api.get("/records/{record_id}/export")
     def export_record(record_id: str):
@@ -293,6 +323,19 @@ def create_app(config: Config | None = None) -> FastAPI:
         filename = "requestwatch-" + side + (".txt" if view == "text" else ".bin")
         headers = {"X-Body-Complete": str(not record.get(side + "_truncated", False) and record.get(side + "_body_complete", True)).lower()}
         try:
+            captured_headers = {str(k).lower(): str(v) for k, v in record.get(side + "_headers", [])}
+            content_type = captured_headers.get("content-type", "")
+            if (view == "text" and content_type.split(";", 1)[0].strip().lower() == "text/event-stream"
+                    and record.get(side + "_body_ref") and not record.get(side + "_sse_utf8")):
+                # Older mitmproxy snapshots may decode SSE as Latin-1. Rebuild a
+                # UTF-8 text view from original bytes without rewriting the capture.
+                corrected = store.bodies.snapshot_file(
+                    side, store.bodies.path(record[side + "_body_ref"]),
+                    complete=headers["X-Body-Complete"] == "true", content_type=content_type,
+                    content_encoding=captured_headers.get("content-encoding", ""))
+                ref = corrected.get(side + "_text_ref")
+                if not ref:
+                    raise ValueError("SSE 原始正文无法解码为 UTF-8，请查看原始字节")
             if ref:
                 path = store.bodies.path(ref)
                 if not path.is_file():
@@ -329,9 +372,20 @@ def create_app(config: Config | None = None) -> FastAPI:
         options = {"content_type": content_type, "content_encoding": headers.get("content-encoding", ""),
                    "source_complete": not record.get(side + "_truncated") and record.get(side + "_body_complete", True)}
         try:
-            # Proxy bodies are already dechunked. Prefer its complete charset-decoded
-            # text, which also supports encodings outside the TCP parser's vocabulary.
-            if record.get(side + "_text_ref") and not record.get(side + "_body_binary") and not record.get(side + "_body_decode_error"):
+            # SSE is always UTF-8. Old snapshots may have been decoded as Latin-1;
+            # derive from original bytes, including Brotli/Zstandard, when unmarked.
+            # New proxy snapshots carry an explicit UTF-8 marker and can be reused.
+            is_sse = content_type.split(";", 1)[0].strip().lower() == "text/event-stream"
+            if is_sse and not record.get(side + "_sse_utf8") and record.get(side + "_body_ref"):
+                corrected = store.bodies.snapshot_file(
+                    side, store.bodies.path(record[side + "_body_ref"]),
+                    complete=options["source_complete"], content_type=content_type,
+                    content_encoding=options["content_encoding"])
+                if corrected.get(side + "_text_ref"):
+                    record.update(corrected)
+            if (record.get(side + "_text_ref") and not record.get(side + "_body_binary")
+                    and not record.get(side + "_body_decode_error")
+                    and (not is_sse or record.get(side + "_sse_utf8"))):
                 path = store.bodies.path(record[side + "_text_ref"])
                 options.update(content_type=content_type.split(";")[0] + "; charset=utf-8", content_encoding="")
             else:
@@ -402,14 +456,14 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     @api.get("/sessions/{session_id}/body/{direction}")
     def tcp_session_body(session_id: str, direction: Literal["client", "server"], view: Literal["raw", "text", "latin1"] = "text", download: bool = False):
-        session = get_session(session_id)
+        get_session(session_id)
         try:
-            path = streams.body_path(session_id, direction, view)
+            path, data = streams.body_path(session_id, direction, view, with_metadata=True)
         except (OSError, ValueError, KeyError) as exc:
             raise HTTPException(410, "TCP 会话文件不可用") from exc
         return FileResponse(path, media_type="application/octet-stream" if view == "raw" else "text/plain; charset=utf-8",
                             filename=("requestwatch-tcp-" + direction + (".bin" if view == "raw" else ".txt")) if download else None,
-                            headers={"X-Body-Complete": str(bool(session.get("complete"))).lower()})
+                            headers={"X-Body-Complete": str(bool(data.get("complete"))).lower()})
 
     @api.get("/sessions/{session_id}/readable/{direction}")
     def session_readable(session_id: str, direction: Literal["client", "server"]):
@@ -526,6 +580,12 @@ def create_app(config: Config | None = None) -> FastAPI:
         record["state"] = "captured"
         captured = runtime.ingest(record, can_intercept=True)
         return {key: captured[key] for key in ("id", "state", "timeout_seconds", "deadline") if key in captured}
+
+    @api.post("/internal/heartbeat")
+    def internal_heartbeat(body: HeartbeatInput):
+        if any(not record_id or len(record_id) > 128 for record_id in body.record_ids):
+            raise HTTPException(422, "无效的活动记录 ID")
+        return {"updated": store.touch_http(body.record_ids)}
 
     @api.get("/internal/decision/{record_id}")
     def internal_decision(record_id: str):

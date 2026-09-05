@@ -49,6 +49,7 @@
             <div class="stat"><span>TCP / UDP</span><strong id="stat-packets">—</strong><small>当前保留的网络层数据包</small></div>
           </div>
           <div class="capture-summary" aria-label="捕获统计说明"><div><span id="capture-retention">正在读取保留数量…</span><span id="capture-last">最近捕获：—</span><span id="capture-poll-state">每 2 秒自动刷新</span></div><p id="capture-counter-note" hidden></p></div>
+          <div id="capture-loss-alert" class="notice warning" hidden></div>
           <div class="engine-strip"><span><i id="capture-dot" class="engine-dot"></i>抓包引擎 <strong id="capture-state">检测中</strong></span><span><i id="proxy-dot" class="engine-dot"></i>HTTP 代理 <strong id="proxy-state">检测中</strong></span><span><i id="docker-dot" class="engine-dot"></i>Docker <strong id="docker-state">检测中</strong></span><button class="text-button" data-view="guide">查看接入方式 ↗</button></div>
           <section class="traffic-panel" aria-label="流量列表和详情">
             <form id="filter-form" class="filter-bar" role="search">
@@ -67,10 +68,12 @@
               <aside class="detail-panel" aria-label="记录详情">
                 <div class="detail-empty" id="detail-empty"><span class="detail-cross" aria-hidden="true">+</span><h3>从一条请求开始</h3><p>选择左侧记录，查看请求内容、响应和原始字节，并进行放行、丢弃或重发。</p><span class="keyboard-hint">使用顶部搜索快速定位内容</span></div>
                 <div id="detail-content" hidden>
-                  <div class="detail-heading"><div><span class="tiny-label">REQUEST INSPECTOR</span><h2 id="detail-title">请求详情</h2></div><button id="close-detail" class="icon-button" aria-label="关闭详情">×</button></div>
+                  <div class="detail-heading"><div><span id="detail-inspector-label" class="tiny-label">HTTP INSPECTOR</span><h2 id="detail-title">请求详情</h2></div><button id="close-detail" class="icon-button" aria-label="关闭详情">×</button></div>
                   <div class="detail-meta-line"><span id="detail-protocol" class="badge"></span><span id="detail-state" class="badge"></span><span id="detail-id" class="muted mono"></span></div>
                   <p class="detail-url mono" id="detail-url"></p>
                   <div id="detail-alert" class="notice compact" hidden></div>
+                  <button id="detail-retry" class="button secondary compact detail-retry" hidden>重新读取详情</button>
+                  <div id="packet-context" class="packet-context" hidden></div>
                   <div class="detail-tabs" role="tablist" aria-label="详情内容"><button role="tab" class="active" data-tab="overview" aria-selected="true">概要</button><button role="tab" data-tab="request" aria-selected="false">请求</button><button role="tab" data-tab="response" aria-selected="false">响应</button><button role="tab" data-tab="hex" aria-selected="false">HEX</button></div>
                   <div id="detail-body" class="detail-body" role="tabpanel"></div>
                   <div class="edit-bar"><button id="edit-button" class="button secondary compact">编辑内容</button><div class="download-actions"><button id="message-download" class="text-button">下载完整请求 ↗</button><button id="body-download" class="text-button">下载原始正文 ↗</button><button id="export-button" class="text-button">元数据 JSON ↗</button></div></div>

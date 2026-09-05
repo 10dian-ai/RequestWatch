@@ -5,7 +5,7 @@
   const $ = (id) => document.getElementById(id);
   const stateNames = { captured: '已捕获', pending: '等待处理', resolving: '处理中', forwarded: '已放行', dropped: '已丢弃', error: '错误', replayed: '已重发' };
   const titles = { traffic: '网络流量', pending: '拦截队列', rules: '拦截规则', containers: 'Docker 容器', sessions: 'TCP 会话', settings: '项目设置', guide: '接入指南' };
-  const s = { view: 'traffic', status: null, records: [], containers: [], rules: [], selected: null, selectedId: null, tab: 'overview', polling: true, authenticated: true, refreshing: false, refreshAgain: false, offset: 0, limit: 50, total: 0, requestVersion: 0, detailVersion: 0, detailLoaded: false, editing: false, draftOriginal: null, actionBusy: false, lastInventory: 0 };
+  const s = { view: 'traffic', status: null, records: [], containers: [], rules: [], selected: null, selectedId: null, tab: 'overview', polling: true, authenticated: true, refreshing: false, refreshAgain: false, offset: 0, limit: 50, total: 0, requestVersion: 0, detailVersion: 0, detailLoaded: false, detailLoading: false, detailError: '', editing: false, draftOriginal: null, actionBusy: false, lastInventory: 0 };
   let token = '';
   try { token = sessionStorage.getItem('requestwatch-token') || ''; } catch (_) { /* Session storage can be unavailable in hardened browsers. */ }
   let searchTimer;
@@ -151,6 +151,8 @@
       $(`${key}-state`).title = info.detail || info.label;
       $(`${key}-dot`).className = `engine-dot ${info.good ? 'online' : 'offline'}`;
     });
+    const droppedPackets = Number(status.capture?.passive_dropped || 0);
+    message('capture-loss-alert', droppedPackets > 0 ? `观察队列过载，已丢弃 ${droppedPackets.toLocaleString('zh-CN')} 个包；部分连接可能缺少内容。请检查服务器负载与抓包范围。` : '', 'warning');
     $('guide-proxy-env').textContent = `HTTP_PROXY=http://<服务器IP>:${status.proxy_port || 8080}\nHTTPS_PROXY=http://<服务器IP>:${status.proxy_port || 8080}`;
     $('protected-ports').textContent = (status.protected_ports || [22, 7030, 8080]).join('、');
     $('runtime-summary').textContent = `工作台 :${status.port || 7030} · HTTP 代理 :${status.proxy_port || 8080} · ${status.mode === 'demo' ? '演示模式' : '实时模式'}。抓包：${engineInfo(status.capture).detail || engineInfo(status.capture).label}；代理：${engineInfo(status.proxy).detail || engineInfo(status.proxy).label}。`;
@@ -271,13 +273,13 @@
           else renderRecords();
         }
         if (s.selectedId) {
-          const selectedId = s.selectedId;
+          const selectedId = s.selectedId; const detailVersion = s.detailVersion;
           try {
             const record = await api(`/api/records/${encodeURIComponent(selectedId)}`);
-            if (s.selectedId === selectedId) { s.selected = record; s.detailLoaded = true; renderDetail(false); }
+            if (s.selectedId === selectedId && s.detailVersion === detailVersion) { s.selected = record; s.detailLoaded = true; s.detailLoading = false; s.detailError = ''; renderDetail(false); }
           } catch (error) {
             if (error.status === 401 || error.status === 403) throw error;
-            if (s.selectedId === selectedId) message('detail-alert', `详情更新失败：${error.message}。当前展示上次读取的内容。`, 'compact danger');
+            if (s.selectedId === selectedId && s.detailVersion === detailVersion) { s.detailLoading = false; s.detailError = error.message; renderDetail(false); }
           }
         }
       }
@@ -312,21 +314,26 @@
     refresh(true);
   }
   async function selectRecord(id) {
-    if (s.selectedId === id) return;
+    if (s.selectedId === id && (s.detailLoading || (s.detailLoaded && !s.detailError))) return;
     if (s.actionBusy) { toast('当前操作正在提交，请稍候。'); return; }
     if (s.editing && draftDirty() && !await confirmAction('切换请求？', '当前草稿尚未提交，切换后将丢弃此草稿。', '切换请求')) return;
-    s.selectedId = id; s.detailLoaded = false; s.editing = false; s.draftOriginal = null;
+    const previousRecord = s.selectedId === id ? s.selected : null;
+    const previousLoaded = Boolean(previousRecord && s.detailLoaded);
+    s.selectedId = id; s.detailLoaded = previousLoaded; s.detailLoading = true; s.detailError = ''; s.editing = false; s.draftOriginal = null;
     s.hexPage = 0; s.hexSide = 'request'; bodyCache.clear(); hexCache.clear(); readableCache.clear();
     $('edit-form').hidden = true; $('edit-button').textContent = '编辑内容';
-    s.selected = s.records.find((record) => record.id === id) || null;
+    s.selected = previousLoaded ? previousRecord : s.records.find((record) => record.id === id) || previousRecord;
     const version = ++s.detailVersion;
     renderRecords();
     if (s.selected) renderDetail(true);
     try {
       const record = await api(`/api/records/${encodeURIComponent(id)}`);
       if (version !== s.detailVersion || id !== s.selectedId) return;
-      s.selected = record; s.detailLoaded = true; renderDetail(true);
-    } catch (error) { toast(`加载详情失败：${error.message}`, true); }
+      s.selected = record; s.detailLoaded = true; s.detailLoading = false; s.detailError = ''; renderDetail(true);
+    } catch (error) {
+      if (version !== s.detailVersion || id !== s.selectedId) return;
+      s.detailLoading = false; s.detailError = error.message; renderDetail(true);
+    }
   }
   function addMetadata(list, label, value, code = false) { list.append(element('dt', label), element('dd', value === undefined || value === null || value === '' ? '—' : value, code ? 'mono' : '')); }
   function addCode(target, heading, content, className = '') {
@@ -362,8 +369,13 @@
       .finally(() => { if (s.selectedId === record.id && bodyEntry(s.selected, side) === entry) renderDetail(false); });
     return entry;
   }
+  function bodyStreaming(record, side) { return side === 'response' && record.response_streaming === true; }
   function bodyComplete(record, side) {
-    return !record[`${side}_truncated`] && record[`${side}_body_complete`] !== false;
+    return !bodyStreaming(record, side) && !record[`${side}_truncated`] && record[`${side}_body_complete`] !== false;
+  }
+  function bodyStatusText(record, side) {
+    if (bodyStreaming(record, side)) return '流式响应进行中，显示截至当前已保存的内容';
+    return bodyComplete(record, side) ? '完整保存' : '内容不完整，仅显示已保存字节';
   }
   function readableBodyKey(record, side) {
     return `${bodyKey(record, side)}:${JSON.stringify(record[`${side}_headers`] || [])}:${record[`${side}_body_complete`]}`;
@@ -404,7 +416,8 @@
       status.append(retry); target.append(status); return;
     }
     const complete = bodyComplete(record, side);
-    status.append(element('span', complete ? `原始正文完整保存 · ${bytes(record[`${side}_body_size`] ?? new TextEncoder().encode(entry.text || entry.content || '').length)}` : '此历史记录未保存完整正文；需要重新抓取', `detail-note${complete ? '' : ' body-error'}`)); target.append(status);
+    status.append(element('span', `${complete ? '原始正文完整保存' : bodyStatusText(record, side)} · ${bytes(record[`${side}_body_size`] ?? new TextEncoder().encode(entry.text || entry.content || '').length)}`, `detail-note${complete || bodyStreaming(record, side) ? '' : ' body-error'}`)); target.append(status);
+    if (bodyStreaming(record, side) && !record[`${side}_body_size`]) target.append(element('p', '已收到响应头，正在等待第一段响应正文。', 'detail-note'));
     if (format === 'auto') appendReadable(target, entry, caption);
     else addCode(target, caption, entry.text, 'full-body');
     if (record[`${side}_body_binary`] || (side === 'request' && record.body_binary)) target.append(element('p', '二进制正文的文本视图可能包含替代字符。HEX 和「下载原始正文」保留全部原始字节；未编辑正文时也保持原始字节。', 'detail-note'));
@@ -477,6 +490,9 @@
     $('detail-content').hidden = !record;
     if (!record) return;
     if (record.source === 'http' && s.detailLoaded) { loadBody(record, 'request'); loadBody(record, 'response'); }
+    $('detail-inspector-label').textContent = record.source === 'http' ? 'HTTP INSPECTOR' : 'PACKET INSPECTOR';
+    document.querySelector('[data-tab="request"]').textContent = record.source === 'http' ? '请求' : '单包载荷';
+    document.querySelector('[data-tab="response"]').textContent = record.source === 'http' ? '响应' : record.response_body_text ? '重发返回' : '返回方向';
     $('detail-title').textContent = recordTitle(record);
     $('detail-title').title = recordTitle(record);
     $('detail-protocol').replaceWith(Object.assign(protocolBadge(record), { id: 'detail-protocol' }));
@@ -488,10 +504,14 @@
     if (record.error) alerts.push(record.error);
     if (s.uncertainReplayId === record.id) alerts.push('重发结果尚未确认：请求可能已经发送。请先检查网络流量中的重发记录，避免重复发送。');
     if (record.detail) alerts.push(record.detail);
-    if (record.request_truncated || record.response_truncated || record.truncated || record.request_body_complete === false || record.response_body_complete === false) alerts.push('此记录有未完整保存的内容，无法恢复缺失字节。请重新抓取；下方会显示已保留内容与完整性状态。');
-    if (!s.detailLoaded) alerts.push('正在加载完整请求内容…');
+    if (record.response_streaming) alerts.push('流式响应仍在接收，正文会随采集继续更新。');
+    if (record.request_truncated || record.response_truncated || record.truncated || record.request_body_complete === false || (record.response_body_complete === false && !record.response_streaming)) alerts.push('此记录未确认完整，下面只显示已保存内容；未捕获的字节无法补回。');
+    if (s.detailLoading) alerts.push('正在读取此条记录的详情…');
+    if (s.detailError) alerts.push(`详情${s.detailLoaded ? '更新' : '加载'}失败：${s.detailError}。${s.detailLoaded ? '下方保留上次成功读取的内容。' : '列表仅提供摘要，完整内容尚未加载。'}`);
     if (record.state === 'pending') alerts.push(record.deadline ? `请求已暂停，剩余约 ${Math.max(0, Math.ceil(record.deadline - Date.now() / 1000))} 秒；超时后由服务端按配置处理。` : '请求已暂停，等待处理；超时后由服务端按配置处理。');
-    message('detail-alert', alerts.join(' '), `compact ${record.error ? 'danger' : record.state === 'pending' ? 'warning' : ''}`);
+    message('detail-alert', alerts.join(' '), `compact ${record.error || s.detailError ? 'danger' : record.state === 'pending' ? 'warning' : ''}`);
+    $('detail-retry').hidden = !s.detailError; $('detail-retry').disabled = s.detailLoading;
+    renderPacketContext(record);
     $('pending-actions').hidden = record.state !== 'pending';
     $('accept-button').disabled = s.actionBusy || !s.detailLoaded || record.state !== 'pending';
     $('drop-button').disabled = s.actionBusy || !s.detailLoaded || record.state !== 'pending';
@@ -511,11 +531,15 @@
     document.querySelectorAll('[data-tab]').forEach((node) => { const selected = node.dataset.tab === s.tab; node.classList.toggle('active', selected); node.setAttribute('aria-selected', String(selected)); });
     const target = $('detail-body');
     const loadState = ['request', 'response'].includes(s.tab) ? [bodyEntry(record, s.tab)?.state, readableBodyEntry(record, s.tab)?.state, readableBodyEntry(record, s.tab)?.error, s.bodyFormat[s.tab]] : null;
-    const renderKey = JSON.stringify([s.tab, record, loadState, s.hexSide, s.hexPage, s.tab === 'hex' ? [...hexCache].map(([key, value]) => [key, value.state, value.error]) : null]);
+    const renderKey = JSON.stringify([s.tab, record, s.detailLoaded, s.detailLoading, s.detailError, loadState, s.hexSide, s.hexPage, s.tab === 'hex' ? [...hexCache].map(([key, value]) => [key, value.state, value.error]) : null]);
     if (target.dataset.renderKey === renderKey) return;
     target.dataset.renderKey = renderKey;
     rememberReading(target);
     target.replaceChildren();
+    if (!s.detailLoaded && s.tab !== 'overview') {
+      target.append(element('p', s.detailLoading ? '正在读取完整记录。读取完成后显示全部已保存的内容。' : '完整记录尚未加载，请点击上方“重新读取详情”。', 'detail-note'));
+      return;
+    }
     if (s.tab === 'overview') {
       const list = element('dl', null, 'metadata');
       addMetadata(list, '捕获时间', time(record.created_at, true));
@@ -525,26 +549,28 @@
       addMetadata(list, 'Docker 容器', record.container_name || '本机 / 未识别');
       addMetadata(list, '来源识别', typeof record.attribution === 'object' ? JSON.stringify(record.attribution) : record.attribution);
       addMetadata(list, '数据大小', bytes(record.payload_size ?? record.request_body_size ?? requestBytes(record).length / 2));
-      if (record.source === 'http') { addMetadata(list, '请求正文', `${bytes(record.request_body_size)} · ${bodyComplete(record, 'request') ? '完整保存' : '内容不完整'}`); if (bodyPresent(record, 'response')) addMetadata(list, '响应正文', `${bytes(record.response_body_size)} · ${bodyComplete(record, 'response') ? '完整保存' : '内容不完整'}`); addMetadata(list, '响应状态', record.status_code); addMetadata(list, '总耗时', record.duration_ms !== null && record.duration_ms !== undefined ? `${Number(record.duration_ms).toFixed(0)} ms` : '等待响应'); }
+      if (record.source === 'http') { addMetadata(list, '请求正文', `${bytes(record.request_body_size)} · ${bodyStatusText(record, 'request')}`); if (bodyPresent(record, 'response')) addMetadata(list, '响应正文', `${bytes(record.response_body_size)} · ${bodyStatusText(record, 'response')}`); addMetadata(list, '响应状态', record.status_code); addMetadata(list, '总耗时', record.duration_ms !== null && record.duration_ms !== undefined ? `${Number(record.duration_ms).toFixed(0)} ms` : '等待响应'); }
       if (record.matched_rule || record.rule_name) addMetadata(list, '命中规则', record.rule_name || record.matched_rule);
       target.append(list);
-      if (record.tcp_session_id) addSessionLink(target, record.tcp_session_id);
     } else if (s.tab === 'request') {
       if (record.source === 'http') {
         addCode(target, 'REQUEST LINE', `${record.method || 'GET'} ${record.url || ''}`);
         addCode(target, '请求头', headerText(record.request_headers));
         renderHttpBody(target, record, 'request');
       } else {
-        addCode(target, '载荷 · 文本视图', record.payload_text);
-        if (record.tcp_session_id) addSessionLink(target, record.tcp_session_id);
-        target.append(element('p', '这里是单包载荷。TCP 连接可在「TCP 会话」中查看双向重组内容；加密流量仍显示密文字节。', 'detail-note'));
+        const packetText = packetPayloadText(record);
+        target.append(element('p', `此包已保存 ${bytes(requestBytes(record).length / 2 || record.payload_size)} 载荷 · UTF-8 原文`, 'detail-note'));
+        addCode(target, '单包载荷 · 全部已保存字节的文本视图', packetText, 'packet-full-body');
+        if (packetText.includes('\ufffd')) target.append(element('p', '单包可能在 UTF-8 字符中间分割，也可能包含二进制数据。请查看 TCP 会话重组文本，或用 HEX 查看原始字节。', 'detail-note'));
+        if (!requestBytes(record) && !record.payload_text) target.append(element('p', '此包没有应用载荷，可能是 TCP 握手、确认或关闭报文；连接内容请查看 TCP 会话。', 'detail-note'));
       }
     } else if (s.tab === 'response') {
       if (record.source !== 'http') {
         if (record.response_body_text) addCode(target, '重发连接返回的载荷', record.response_body_text);
-        else target.append(element('p', '原始网络包没有独立的 HTTP 响应。可搜索反向地址查看返回的数据包。', 'detail-note'));
+        else target.append(element('p', record.protocol === 'TCP' ? '每条网络包记录只保存当前方向的一个包。打开上方关联的 TCP 会话，并切换方向，可查看此连接已捕获的返回内容。' : 'UDP 数据报没有独立的 HTTP 响应。可按反向地址查找返回的数据报。', 'detail-note'));
+        if (record.protocol === 'TCP' && record.tcp_session_id && record.tcp_session_available !== false) addSessionLink(target, record.tcp_session_id, record.tcp_session_direction === 'client' ? 'server' : record.tcp_session_direction === 'server' ? 'client' : null, '查看此连接的返回方向 →');
       }
-      else if (!bodyPresent(record, 'response')) target.append(element('p', record.state === 'pending' ? '请求正在等待放行，尚无响应。' : record.state === 'dropped' ? '请求已丢弃，没有响应。' : '尚未收到响应，或当前记录没有响应内容。', 'detail-note'));
+      else if (!bodyPresent(record, 'response')) target.append(element('p', record.state === 'pending' ? '请求正在等待放行，尚无响应。' : record.state === 'dropped' ? '请求已丢弃，没有响应。' : record.response_streaming ? '流式响应已开始，正在等待第一段正文。' : '尚未收到响应，或当前记录没有响应内容。', 'detail-note'));
       else { addCode(target, 'HTTP 状态', record.status_code); addCode(target, '响应头', headerText(record.response_headers)); renderHttpBody(target, record, 'response'); }
     } else {
       renderHex(target, record);
@@ -649,9 +675,23 @@
     } catch (error) { toast(`下载失败：${error.message}`, true); }
   }
 
-  function addSessionLink(target, id) {
-    const button = element('button', '查看此连接的 TCP 会话全文 →', 'text-button session-link');
-    button.addEventListener('click', () => { setView('sessions'); selectSession(id); }); target.append(button);
+  function packetPayloadText(record) {
+    const hex = requestBytes(record);
+    if (!hex || hex.length % 2 || !/^[0-9a-f]+$/i.test(hex)) return record.payload_text || '';
+    return new TextDecoder('utf-8').decode(Uint8Array.from(hex.match(/../g), value => parseInt(value, 16)));
+  }
+  function renderPacketContext(record) {
+    const target = $('packet-context'); target.replaceChildren(); target.hidden = record.source === 'http';
+    if (target.hidden) return;
+    const isTcp = record.protocol === 'TCP';
+    target.append(element('p', isTcp ? '当前是一条 TCP 包，通常只包含请求或响应中的一小段。整段对话请打开关联会话，查看两个方向的重组内容。' : '当前是一条 UDP 数据报，下面显示本条数据报已保存的全部载荷。', 'detail-note'));
+    if (!isTcp) return;
+    if (record.tcp_session_id && record.tcp_session_available !== false) addSessionLink(target, record.tcp_session_id, record.tcp_session_direction, '打开关联 TCP 会话 · 查看完整通信 →');
+    else if (s.detailLoaded) target.append(element('p', record.tcp_session_error ? `TCP 会话重组失败：${record.tcp_session_error}` : record.tcp_session_available === false ? (record.tcp_session_unavailable_reason || '关联会话已超过保留范围，无法从此单包恢复其余通信内容。') : '此记录未关联可用的 TCP 会话；可能是旧版本记录、重发载荷或采集时未保存连接。', 'detail-note body-error'));
+  }
+  function addSessionLink(target, id, side = null, caption = '查看此连接的 TCP 会话全文 →') {
+    const button = element('button', caption, 'text-button session-link');
+    button.addEventListener('click', () => { setView('sessions'); selectSession(id, side); }); target.append(button);
   }
   function sessionState(session) {
     return { open: '采集中', closed: '已关闭', reset: '连接复位', interrupted: '采集中断' }[session.state] || session.state || '未知';
@@ -689,8 +729,9 @@
       catch (error) { if (id === s.sessionId) message('session-alert', `会话更新失败：${error.message}。当前内容为上次读取的结果。`, 'compact danger'); }
     }
   }
-  async function selectSession(id) {
+  async function selectSession(id, preferredSide = null) {
     if (s.sessionId !== id) { s.sessionId = id; s.sessionSelected = null; s.sessionHexPage = 0; s.sessionSide = 'client'; sessionBodyCache.clear(); }
+    if (['client', 'server'].includes(preferredSide)) s.sessionSide = preferredSide;
     renderSessions();
     delete $('session-content').dataset.renderKey;
     $('session-detail-empty').hidden = true; $('session-detail').hidden = false; $('session-content').replaceChildren(element('p', '正在读取会话详情…', 'detail-note'));
@@ -1002,6 +1043,7 @@
   $('previous-page').addEventListener('click', () => { s.offset = Math.max(0, s.offset - s.limit); s.requestVersion++; refresh(true); });
   $('next-page').addEventListener('click', () => { if (s.offset + s.limit < s.total) { s.offset += s.limit; s.requestVersion++; refresh(true); } });
   $('close-detail').addEventListener('click', async () => { if (s.actionBusy) { toast('当前操作正在提交，请稍候。'); return; } if (s.editing && draftDirty() && !await confirmAction('关闭详情？', '当前草稿尚未提交，关闭后将丢弃此草稿。', '关闭详情')) return; s.selected = null; s.selectedId = null; s.editing = false; s.draftOriginal = null; s.detailVersion++; renderDetail(); renderRecords(); });
+  $('detail-retry').addEventListener('click', () => { if (s.selectedId) selectRecord(s.selectedId); });
   $('edit-button').addEventListener('click', openEditor);
   $('edit-form').addEventListener('submit', (event) => event.preventDefault());
   $('edit-form').addEventListener('input', () => { $('draft-status').textContent = draftDirty() ? '存在未提交的修改' : '修改仅在放行 / 重发时提交'; });

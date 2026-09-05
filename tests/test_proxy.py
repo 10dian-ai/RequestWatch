@@ -279,7 +279,9 @@ def test_api_failure_during_ingest_preserves_original():
         await addon.request(item)
         assert item.request is original
         assert item.response is None
-        assert "rw_id" not in item.metadata
+        # A lost acknowledgement may follow a committed ingest. Retain the ID
+        # for a later final update while preserving the original request unchanged.
+        assert item.metadata["rw_id"] == item.id
     asyncio.run(run())
 
 
@@ -472,7 +474,7 @@ def test_live_proxy_roundtrip(tmp_path, use_tls, monkeypatch):
             large_response = client.post(origin_url + "/large", content=large_body)
             assert large_response.json()["body"].encode() == large_body
         deadline = time.monotonic() + 5
-        while not (len(records) == 4 and all(r.get("status_code") for r in records.values())):
+        while not (len(records) == 4 and all(r.get("status_code") and not r.get("http_in_flight") for r in records.values())):
             if time.monotonic() >= deadline:
                 pytest.fail("Missing capture updates: " + repr(records))
             time.sleep(0.02)

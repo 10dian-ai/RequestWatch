@@ -297,14 +297,20 @@ class NetworkEngine:
 
     def stop(self):
         self._stop.set()
-        if self._thread and self._thread is not threading.current_thread():
-            self._thread.join(timeout=12)
+        # Stop producers before draining the observation queue. Otherwise the
+        # sniffer can enqueue more bytes after the worker's final flush.
         if self._sniffer:
             try:
                 if getattr(self._sniffer, "running", False):
                     self._sniffer.stop()
             except Exception as exc:
                 self._capture_error = str(exc)
+        if self._thread and self._thread is not threading.current_thread():
+            self._thread.join(timeout=12)
+        if not self._thread or not self._thread.is_alive():
+            # Also cover observations queued while the worker was entering its
+            # final flush, before sniffer.stop() completed.
+            self._flush_passive(force=True)
         self._capture_running = False
 
     def status(self):
@@ -464,7 +470,10 @@ class NetworkEngine:
 
     def _flush_passive(self, force=False):
         # Coalesce a sniff copy with its authoritative NFQUEUE observation.
-        for _ in range(512):
+        # Normal batches leave time for interception verdicts. Shutdown must
+        # drain the entire queued snapshot, which can contain 4096 packets.
+        budget = self._observations.qsize() if force else 512
+        for _ in range(budget):
             with self._observations.mutex:
                 if not self._observations.queue:
                     break

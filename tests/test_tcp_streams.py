@@ -326,3 +326,38 @@ def test_search_does_not_hide_disk_corruption_or_permission_errors(streams, monk
     spool.write_bytes(b"c")
     with pytest.raises(OSError, match="shorter"):
         streams.list_sessions(q="content")
+
+
+def test_closed_midstream_retransmission_with_negative_offset_stays_in_session(streams):
+    sid = streams.ingest(packet(b"def", seq=1))
+    streams.ingest(packet(b"abc", seq=0xfffffffe))
+    streams.ingest(packet(seq=4, flags=0x11))
+    streams.ingest(packet(seq=200, flags=0x11, reverse=True))
+    assert streams.get(sid)["state"] == "closed"
+    assert streams.body_path(sid, "client").read_bytes() == b"abcdef"
+    assert streams.ingest(packet(b"abc", seq=0xfffffffe)) == sid
+    assert streams.body_path(sid, "client").read_bytes() == b"abcdef"
+    newer = streams.ingest(packet(b"new", seq=0xfffffffb))
+    assert newer != sid
+    assert streams.body_path(newer, "client").read_bytes() == b"new"
+
+
+def test_utf8_export_never_combines_partial_characters_across_a_gap(streams):
+    sid = handshake(streams)
+    streams.ingest(packet(b"\xe4", seq=100))
+    streams.ingest(packet(b"\xb8\xad", seq=104))
+    assert streams.get(sid)["directions"]["client"]["missing_bytes"] == 3
+    # Raw exports contain every observed byte in sequence order, with missing
+    # ranges omitted. UTF-8 views must retain the discontinuity while decoding.
+    assert streams.body_path(sid, "client").read_bytes() == b"\xe4\xb8\xad"
+    old = streams.root / f"{sid}-client-2.text"
+    old.write_bytes(b"\xe4\xb8\xad")
+    rendered = streams.body_path(sid, "client", "text")
+    assert rendered != old
+    assert rendered.read_text("utf-8") == "\ufffd\ufffd\ufffd"
+    assert streams.list_sessions(q="\u4e2d")["total"] == 0
+    # The same byte sequence is a valid character when capture contains no hole.
+    other = streams.ingest(packet(b"\xe4", seq=1000))
+    assert other == sid  # Same open connection; use a later contiguous range.
+    streams.ingest(packet(b"\xb8\xad", seq=1001))
+    assert streams.body_path(sid, "client", "text").read_text("utf-8").endswith("\u4e2d")

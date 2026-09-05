@@ -15,6 +15,7 @@ from pathlib import Path
 import os
 import re
 import time
+import tempfile
 from typing import Any
 from urllib.parse import quote, urlsplit
 
@@ -22,8 +23,10 @@ import httpx
 
 try:
     from mitmproxy import http
+    from mitmproxy.net.http.headers import infer_content_encoding
 except ImportError:  # Pure edit and timeout helpers are testable without mitmproxy.
     http = None
+    infer_content_encoding = None
 
 # mitmdump executes this file as an independent module in its own venv.
 # Load the adjacent stdlib-only body store without importing the web application.
@@ -39,6 +42,7 @@ else:
 PREVIEW_BYTES = 64 * 1024
 API_OUTAGE_SECONDS = 3.0
 POLL_SECONDS = 0.20
+HEARTBEAT_SECONDS = 10.0
 TOKEN_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 log = logging.getLogger("requestwatch.proxy")
 
@@ -59,7 +63,14 @@ def body_snapshot(message: Any, prefix: str, body_store: Any = None) -> dict[str
         return failed_body_snapshot(message, prefix, "Body unavailable (streamed or incomplete capture)")
     decode_error = None
     try:
-        text = message.get_text(strict=True) or ""
+        content_type = next((v for k, v in header_pairs(message.headers) if k.lower() == "content-type"), "")
+        if "text/event-stream" in content_type.lower():
+            # SSE is always UTF-8, including when no charset is declared. mitmproxy's
+            # general text fallback is latin-1 and would corrupt Chinese SSE text.
+            content = message.get_content(strict=True) if hasattr(message, "get_content") else raw
+            text = (content or b"").decode("utf-8-sig")
+        else:
+            text = message.get_text(strict=True) or ""
     except (ValueError, LookupError) as exc:
         decode_error = safe_text(str(exc))
         try:
@@ -85,6 +96,7 @@ def body_snapshot(message: Any, prefix: str, body_store: Any = None) -> dict[str
     result[f"{prefix}_body_binary"] = binary
     result[f"{prefix}_body_error"] = None
     result[f"{prefix}_body_decode_error"] = decode_error
+    result[f"{prefix}_sse_utf8"] = decode_error is None and "text/event-stream" in content_type.lower()
     return result
 
 
@@ -179,6 +191,38 @@ def edited_request(request: Any, edits: dict[str, Any]) -> Any:
     return changed
 
 
+class ResponseCapture:
+    """A lossless tee: append encoded body bytes, return precisely the input chunk."""
+    def __init__(self, body_store):
+        self.body_store = body_store
+        fd, name = tempfile.mkstemp(prefix=".stream-", dir=body_store.root)
+        self.path = Path(name)
+        self.output = os.fdopen(fd, "wb", buffering=0)
+        self.size = 0
+        self.received = 0
+        self.error = None
+        self.last_snapshot = None
+        self.stop = asyncio.Event()
+        self.task = None
+
+    def feed(self, chunk):
+        self.received += len(chunk)
+        if chunk and self.error is None:
+            try:
+                written = self.output.write(chunk)
+                self.size += written
+                if written != len(chunk):
+                    raise OSError("Short write while saving streamed response")
+            except OSError as exc:
+                self.error = str(exc)
+                log.warning("Could not save streamed response: %s", exc)
+        return chunk
+
+    def close(self):
+        self.output.close()
+        self.path.unlink(missing_ok=True)
+
+
 class RequestWatchAddon:
     def __init__(self, api_url: str | None = None, token: str | None = None,
                  client: Any = None, body_store: Any = None):
@@ -189,6 +233,10 @@ class RequestWatchAddon:
         self.data_dir = os.getenv("RW_DATA_DIR")
         self._tasks: set[asyncio.Task] = set()
         self._updates: dict[str, asyncio.Task] = {}
+        self._streams: dict[str, ResponseCapture] = {}
+        self._active_flows: dict[str, str] = {}
+        self._heartbeat_task = None
+        self._heartbeat_wake = asyncio.Event()
 
     async def _snapshot(self, message: Any, prefix: str) -> dict[str, Any]:
         def save():
@@ -225,14 +273,50 @@ class RequestWatchAddon:
             hosts.update({"127.0.0.1", "localhost", "::1"})
         return flow.request.host in hosts and flow.request.port == (target.port or (443 if target.scheme == "https" else 80))
 
+    def _track(self, flow_id, record_id):
+        self._active_flows[flow_id] = record_id
+        if self._heartbeat_task is None or self._heartbeat_task.done():
+            self._heartbeat_task = asyncio.create_task(self._heartbeat())
+
+    def _untrack(self, flow_id):
+        self._active_flows.pop(flow_id, None)
+        if not self._active_flows:
+            self._heartbeat_wake.set()
+
+    async def _heartbeat(self):
+        while self._active_flows:
+            self._heartbeat_wake.clear()
+            try:
+                await asyncio.wait_for(self._heartbeat_wake.wait(), timeout=HEARTBEAT_SECONDS)
+            except asyncio.TimeoutError:
+                pass
+            ids = list(set(self._active_flows.values()))
+            for offset in range(0, len(ids), 500):
+                try:
+                    await asyncio.wait_for(self._api("POST", "/api/internal/heartbeat",
+                        {"record_ids": ids[offset:offset+500]}), timeout=API_OUTAGE_SECONDS)
+                except (httpx.HTTPError, ValueError, OSError, asyncio.TimeoutError):
+                    # The server lease expires honestly during a prolonged outage.
+                    # A quiet live request must not otherwise expire merely for idling.
+                    log.debug("Could not renew RequestWatch active-flow leases")
+
     async def _update(self, record_id: str, changes: dict) -> None:
-        try:
-            await asyncio.wait_for(
-                self._api("PUT", f"/api/internal/records/{quote(record_id, safe='')}", changes),
-                timeout=API_OUTAGE_SECONDS,
-            )
-        except (httpx.HTTPError, ValueError, OSError, asyncio.TimeoutError):
-            log.warning("Could not update a RequestWatch record")
+        terminal = changes.get("http_in_flight") is False
+        attempts = 3 if terminal else 1
+        for attempt in range(attempts):
+            try:
+                await asyncio.wait_for(
+                    self._api("PUT", f"/api/internal/records/{quote(record_id, safe='')}", changes),
+                    timeout=API_OUTAGE_SECONDS)
+                return
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code < 500 and exc.response.status_code != 429:
+                    break  # Authentication failure or an absent/evicted record is definitive.
+            except (httpx.HTTPError, ValueError, OSError, asyncio.TimeoutError):
+                pass
+            if attempt+1 < attempts:
+                await asyncio.sleep(.2 * (attempt+1))
+        log.warning("Could not update a RequestWatch record after %s attempt(s)", attempts)
 
     def _update_later(self, record_id: str, changes: dict) -> None:
         # A down management API must never add another delay before forwarding.
@@ -310,8 +394,14 @@ class RequestWatchAddon:
             "http_version": safe_text(getattr(request, "http_version", "HTTP/1.1")),
             "request_trailers": header_pairs(request.trailers) if getattr(request, "trailers", None) is not None else [],
             "summary": safe_text(f"{request.method} {request.url}"), "state": "captured",
+            "http_in_flight": True,
             "payload_text": self._search_text(request, snapshot), **snapshot,
         }
+        # A timed-out POST may already have committed. Keep the known record ID
+        # so subsequent response/error updates can still complete that same record.
+        flow.metadata["rw_id"] = flow.id
+        flow.metadata["rw_payload"] = record["payload_text"]
+        self._track(flow.id, flow.id)
         try:
             result = await asyncio.wait_for(
                 self._api("POST", "/api/internal/ingest", record), API_OUTAGE_SECONDS)
@@ -320,6 +410,7 @@ class RequestWatchAddon:
             return
         record_id = str(result.get("id", flow.id))
         flow.metadata["rw_id"] = record_id
+        self._track(flow.id, record_id)
         flow.metadata["rw_payload"] = record["payload_text"]
         decision = {"action": "accept"}
         if result.get("state") == "pending":
@@ -332,9 +423,10 @@ class RequestWatchAddon:
             if http is None:
                 raise RuntimeError("mitmproxy is required to drop HTTP requests")
             flow.metadata["rw_dropped"] = True
+            self._untrack(flow.id)
             flow.response = http.Response.make(
                 499, b"Request dropped by RequestWatch\n", {"Content-Type": "text/plain; charset=utf-8"})
-            self._update_later(record_id, {"state": "dropped", "status_code": 499})
+            self._update_later(record_id, {"state": "dropped", "status_code": 499, "http_in_flight": False})
             return
         changes: dict[str, Any] = {"state": "forwarded"}
         if decision.get("reason"):
@@ -354,32 +446,139 @@ class RequestWatchAddon:
                 changes["intercept_note"] = f"Edits rejected; original request released: {exc}"
         self._update_later(record_id, changes)
 
-    async def response(self, flow: Any) -> None:
-        if flow.metadata.get("rw_skip") or "rw_id" not in flow.metadata or flow.metadata.get("rw_dropped"):
+    @staticmethod
+    def _response_fields(flow):
+        response = flow.response
+        headers = header_pairs(response.headers)
+        return {"status_code": response.status_code, "response_headers": headers,
+                "response_http_version": safe_text(getattr(response, "http_version", "HTTP/1.1")),
+                "response_trailers": header_pairs(response.trailers) if getattr(response, "trailers", None) is not None else []}
+
+    async def responseheaders(self, flow: Any) -> None:
+        if flow.metadata.get("rw_skip") or "rw_id" not in flow.metadata or flow.metadata.get("rw_dropped") or flow.response is None:
             return
-        if flow.response is None:
+        # Do not claim to capture a WebSocket conversation after its HTTP upgrade.
+        if flow.response.status_code == 101:
             return
-        snapshot = await self._snapshot(flow.response, "response")
-        headers = header_pairs(flow.response.headers)
-        search = "\n".join(f"{k}: {v}" for k, v in headers)
+        try:
+            if self.body_store is None and self.data_dir:
+                self.body_store = BodyStore(self.data_dir)
+            if self.body_store is None:
+                return  # Legacy standalone/test callers retain the inline buffered path.
+            capture = ResponseCapture(self.body_store)
+        except OSError as exc:
+            flow.metadata["rw_stream_error"] = str(exc)
+            flow.response.stream = True  # Capture failure must not stall the client.
+            return
+        self._streams[flow.id] = capture
+        flow.response.stream = capture.feed
         self._update_later(flow.metadata["rw_id"], {
-            "state": "forwarded", "status_code": flow.response.status_code,
-            "response_headers": headers,
-            "response_http_version": safe_text(getattr(flow.response, "http_version", "HTTP/1.1")),
-            "response_trailers": header_pairs(flow.response.trailers) if getattr(flow.response, "trailers", None) is not None else [],
-            "duration_ms": round((time.monotonic() - flow.metadata["rw_start"]) * 1000, 2),
-            "payload_text": flow.metadata.get("rw_payload", "") + "\n" + search + "\n" + snapshot["response_body_text"],
-            **snapshot,
+            **self._response_fields(flow), "http_in_flight": True,
+            "response_streaming": True, "response_body_complete": False,
+            "response_truncated": False, "response_body_text": "", "response_body_size": 0,
         })
+
+        async def publish_periodically():
+            last_size = -1
+            while not capture.stop.is_set():
+                size = capture.size
+                if size != last_size:
+                    snapshot = await self._stream_snapshot(flow, capture, size, False)
+                    self._update_later(flow.metadata["rw_id"], self._stream_changes(flow, snapshot, False))
+                    # Coalesce while the management API is slow; never accumulate
+                    # an unbounded queue of obsolete body snapshots for one stream.
+                    pending = self._updates.get(flow.metadata["rw_id"])
+                    if pending is not None:
+                        await pending
+                    last_size = size
+                try:
+                    await asyncio.wait_for(capture.stop.wait(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    pass
+        capture.task = asyncio.create_task(publish_periodically())
+
+    async def _stream_snapshot(self, flow, capture, size, complete):
+        headers = {k.lower(): v for k, v in header_pairs(flow.response.headers)}
+        try:
+            snapshot = await asyncio.to_thread(
+                capture.body_store.snapshot_file, "response", capture.path, size=size,
+                complete=complete and capture.error is None,
+                content_type=headers.get("content-type", ""),
+                content_encoding=headers.get("content-encoding", ""),
+                infer_encoding=infer_content_encoding)
+            if capture.error:
+                snapshot.update(response_body_complete=False, response_truncated=True,
+                                response_body_error="Could not save every response byte: " + capture.error,
+                                response_received_size=capture.received)
+            capture.last_snapshot = dict(snapshot)
+            return snapshot
+        except (OSError, ValueError, UnicodeError) as exc:
+            capture.error = str(exc)
+            if capture.last_snapshot is not None:
+                # A failed newer write must not erase the last successfully saved
+                # prefix from the record. Its references remain useful for diagnosis.
+                result = dict(capture.last_snapshot)
+                result.update(response_body_complete=False, response_truncated=True,
+                              response_body_error="Could not save every response byte: " + str(exc))
+            else:
+                result = failed_body_snapshot(flow.response, "response", "Could not save streamed body: " + str(exc))
+            result["response_received_size"] = capture.received
+            return result
+
+    def _stream_changes(self, flow, snapshot, final):
+        fields = self._response_fields(flow)
+        search = "\n".join(f"{k}: {v}" for k, v in fields["response_headers"])
+        return {**fields, **snapshot, "state": "forwarded", "http_in_flight": not final,
+                "response_streaming": not final,
+                "duration_ms": round((time.monotonic()-flow.metadata["rw_start"])*1000, 2),
+                "payload_text": flow.metadata.get("rw_payload", "") + "\n" + search + "\n" + snapshot["response_body_text"]}
+
+    async def _finish_stream(self, flow, complete):
+        capture = self._streams.pop(flow.id, None)
+        if capture is None:
+            return None
+        capture.stop.set()
+        try:
+            if capture.task:
+                await capture.task  # Its earlier snapshot must never overwrite the final one.
+            return await self._stream_snapshot(flow, capture, capture.size, complete)
+        finally:
+            capture.close()
+
+    async def response(self, flow: Any) -> None:
+        if flow.metadata.get("rw_skip") or "rw_id" not in flow.metadata or flow.metadata.get("rw_dropped") or flow.response is None:
+            return
+        snapshot = await self._finish_stream(flow, True)
+        if snapshot is None:
+            snapshot = await self._snapshot(flow.response, "response")
+        self._untrack(flow.id)
+        self._update_later(flow.metadata["rw_id"], self._stream_changes(flow, snapshot, True))
 
     async def error(self, flow: Any) -> None:
         if "rw_id" in flow.metadata and not flow.metadata.get("rw_dropped"):
-            self._update_later(flow.metadata["rw_id"], {
-                "state": "error", "error": safe_text(str(flow.error)),
-                "response_body_complete": False, "response_truncated": True,
-                "response_body_error": "Upstream response did not complete: " + safe_text(str(flow.error)),
-                "duration_ms": round((time.monotonic() - flow.metadata["rw_start"]) * 1000, 2),
-            })
+            snapshot = await self._finish_stream(flow, False)
+            changes = {}
+            if snapshot is not None:
+                changes = self._stream_changes(flow, snapshot, True)
+            elif flow.response is not None:
+                # Buffered fallback may expose partial bytes; preserve whatever exists.
+                snapshot = await self._snapshot(flow.response, "response")
+                changes = self._stream_changes(flow, snapshot, True)
+            changes.update({"state": "error", "error": safe_text(str(flow.error)),
+                            "http_in_flight": False, "response_streaming": False,
+                            "response_body_complete": False, "response_truncated": True,
+                            "response_body_error": "Upstream response did not complete: " + safe_text(str(flow.error)),
+                            "duration_ms": round((time.monotonic()-flow.metadata["rw_start"])*1000, 2)})
+            self._untrack(flow.id)
+            self._update_later(flow.metadata["rw_id"], changes)
+
+    def done(self):
+        # mitmproxy calls done after the event loop stops. Existing published
+        # snapshots remain available; the application marks active records interrupted.
+        for capture in self._streams.values():
+            capture.close()
+        self._streams.clear()
+        self._active_flows.clear()
 
 
 addons = [RequestWatchAddon()]
