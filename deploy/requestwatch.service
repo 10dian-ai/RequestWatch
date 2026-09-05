@@ -1,5 +1,5 @@
 [Unit]
-Description=RequestWatch network inspection and Web UI (7030)
+Description=RequestWatch network inspection and Web UI
 After=network-online.target docker.service systemd-tmpfiles-setup.service
 Wants=network-online.target
 [Service]
@@ -8,6 +8,7 @@ User=root
 WorkingDirectory=/opt/requestwatch
 EnvironmentFile=/etc/requestwatch/requestwatch.env
 ExecStart=/opt/requestwatch/.venv/bin/python -m requestwatch
+# Cleans only tagged RequestWatch rules for initial, saved Web, and last active queue numbers.
 ExecStopPost=/usr/bin/python3 /opt/requestwatch/scripts/cleanup_firewall.py
 Restart=on-failure
 RestartSec=3

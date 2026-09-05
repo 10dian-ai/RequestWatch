@@ -37,7 +37,7 @@ class RuleInput(BaseModel):
         return self
 
 
-def matches(rule: dict, record: dict) -> bool:
+def matches(rule: dict, record: dict, body_store=None) -> bool:
     if not rule.get("enabled", True):
         return False
     if rule.get("source", "any") not in {"any", record.get("source")}:
@@ -62,4 +62,4 @@ def matches(rule: dict, record: dict) -> bool:
                 return False
     # A pause is decided before a response exists. Response-only keywords are searchable later.
     needle = rule.get("keyword", "").casefold()
-    return not needle or needle in searchable(record)
+    return not needle or needle in searchable(record) or bool(body_store and body_store.contains(record, needle))

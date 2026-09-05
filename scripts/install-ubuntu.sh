@@ -65,16 +65,14 @@ systemctl daemon-reload
 systemctl enable requestwatch
 systemctl restart requestwatch
 
-# Read simple systemd EnvironmentFile values without executing the file as shell code.
-read_setting() {
-  local setting_value
-  setting_value="$(awk -v key="$1" 'index($0, key "=") == 1 {value=substr($0, length(key)+2)} END {gsub(/^[ \t]+|[ \t\r]+$/, "", value); gsub(/^[\047\042]|[\047\042]$/, "", value); print value}' /etc/requestwatch/requestwatch.env)"
-  printf '%s' "${setting_value:-$2}"
-}
-web_host="$(read_setting RW_HOST 0.0.0.0)"
-web_port="$(read_setting RW_PORT 7030)"
-data_path="$(read_setting RW_DATA_DIR /var/lib/requestwatch)"
-[[ "$web_port" =~ ^[0-9]+$ ]] && (( 10#$web_port >= 1 && 10#$web_port <= 65535 )) || fail 'RW_PORT 无效，请检查 /etc/requestwatch/requestwatch.env。'
+# Saved Web settings override initial environment values. Python parses both files
+# as data and emits only the public address/data path; no shell eval or token output.
+deployment_values="$(python3 "$project_target/scripts/deployment_settings.py" /etc/requestwatch/requestwatch.env)" || fail '无法读取生效的 Web 配置，请查看上面的设置错误。'
+mapfile -t deployment_fields <<< "$deployment_values"
+[ "${#deployment_fields[@]}" -eq 3 ] || fail '部署配置读取结果无效。'
+web_host="${deployment_fields[0]}"
+web_port="${deployment_fields[1]}"
+data_path="${deployment_fields[2]}"
 case "$web_host" in
   0.0.0.0) check_host=127.0.0.1 ;;
   ::) check_host='[::1]' ;;
@@ -104,12 +102,9 @@ if [ "$web_host" = 0.0.0.0 ] || [ "$web_host" = :: ]; then
 else
   printf 'Web UI：http://%s:%s\n' "$check_host" "$web_port"
 fi
-if [ -n "$(read_setting RW_TOKEN '')" ]; then
-  printf '查看访问令牌：sudo grep '\''^RW_TOKEN='\'' /etc/requestwatch/requestwatch.env\n'
-else
-  printf '查看访问令牌：sudo cat %q\n' "$data_path/admin-token"
-fi
-printf '%s\n' '查看日志：sudo journalctl -u requestwatch -f' \
-  '配置代理监听和其他参数：sudoedit /etc/requestwatch/requestwatch.env' \
-  '修改配置后：sudo systemctl restart requestwatch' \
-  '后续升级可再次执行相同的一键安装指令；配置、数据、令牌和 CA 会保留。'
+# Config.prepare synchronizes the effective token (including Web rotations) here.
+printf '查看访问令牌：sudo cat %q\n' "$data_path/admin-token"
+printf '%s\n' '项目参数、代理监听、访问令牌等均可在 Web UI 的“设置”页面管理。' \
+  '设置保存后由服务自动应用；监听地址或端口改变时按页面提示重新访问。' \
+  '查看日志：sudo journalctl -u requestwatch -f' \
+  '后续升级可再次执行相同的一键安装指令；Web 设置、数据、令牌和 CA 会保留。'

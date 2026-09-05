@@ -1,5 +1,8 @@
 """Remove only RequestWatch's tagged mangle rules after the service stops."""
+import json
 import os
+from pathlib import Path
+import re
 import shutil
 import shlex
 import subprocess
@@ -7,7 +10,7 @@ import sys
 
 
 def cleanup(queue_number: int):
-    if not 1 <= queue_number <= 65535:
+    if isinstance(queue_number, bool) or not isinstance(queue_number, int) or not 1 <= queue_number <= 65535:
         raise ValueError("Invalid queue number")
     chain = f"RWATCH_{queue_number}"
     comment = f"requestwatch-managed-{queue_number}"
@@ -49,9 +52,49 @@ def cleanup(queue_number: int):
         raise RuntimeError("; ".join(errors))
 
 
+def configured_queue_numbers(environ=None):
+    """Read initial, saved, and currently applied queues without interpreting code."""
+    environ = os.environ if environ is None else environ
+    queues, errors = [], []
+
+    def add(value, source):
+        if (isinstance(value, bool) or not isinstance(value, (str, int))
+                or not re.fullmatch(r"[0-9]+", str(value)) or not 1 <= int(value) <= 65535):
+            errors.append(f"Invalid RequestWatch queue number in {source}")
+        elif int(value) not in queues:
+            queues.append(int(value))
+
+    add(environ.get("RW_QUEUE_NUM", "7030"), "RW_QUEUE_NUM")
+    data_dir = Path(environ.get("RW_DATA_DIR") or "/var/lib/requestwatch")
+    for filename, key in (("settings.json", "queue_num"), ("runtime.json", "active_queue_num")):
+        try:
+            data = json.loads((data_dir / filename).read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("Expected a JSON object")
+            if key in data:
+                add(data[key], filename)
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError):
+            errors.append(f"Cannot read RequestWatch {filename}")
+    return queues, errors
+
+
+def cleanup_configured(environ=None):
+    queues, errors = configured_queue_numbers(environ)
+    # An invalid/new configuration must not prevent cleanup of the old active queue.
+    for queue_number in queues:
+        try:
+            cleanup(queue_number)
+        except (ValueError, RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
+            errors.append(f"Queue {queue_number}: {exc}")
+    if errors:
+        raise RuntimeError("; ".join(errors))
+
+
 if __name__ == "__main__":
     try:
-        cleanup(int(os.getenv("RW_QUEUE_NUM", "7030")))
+        cleanup_configured()
     except (ValueError, RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
         print(f"RequestWatch cleanup: {exc}", file=sys.stderr)
         sys.exit(1)

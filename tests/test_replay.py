@@ -8,6 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 
 from requestwatch.replay import replay_http, replay_packet, request_parts, validate_http_edits
+from requestwatch.body_store import BodyStore
 
 
 @pytest.fixture
@@ -30,9 +31,13 @@ def http_origin():
             }
             seen.append(record)
             response = json.dumps(record).encode()
+            if self.path == "/compressed-response":
+                response = gzip.compress(response)
             self.send_response(201)
             self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(response)))
+            if self.path == "/compressed-response":
+                self.send_header("Content-Encoding", "gzip")
+            self.send_header("Content-Length", str(len(response) + (100 if self.path == "/incomplete" else 0)))
             self.send_header("Set-Cookie", "one=1")
             self.send_header("Set-Cookie", "two=2")
             self.end_headers()
@@ -73,9 +78,131 @@ def test_http_replay_reaches_origin_with_binary_body_and_duplicate_headers(http_
     assert base64.b64decode(seen[0]["body_b64"]) == b"original\x00\xff"
     assert seen[0]["connection_secret"] is None
     assert seen[0]["host"] == url.removeprefix("http://")
+    sent_headers = dict(result["request_headers"])
+    assert sent_headers["host"] == seen[0]["host"]
+    assert sent_headers["content-length"] == str(len(b"original\x00\xff"))
     assert [v for k, v in result["response_headers"] if k.lower() == "set-cookie"] == ["one=1", "two=2"]
     assert json.loads(result["response_body_text"])["path"] == "/replay"
     assert base64.b64decode(result["response_body_b64"]).decode() == result["response_body_text"]
+
+
+@pytest.mark.parametrize("use_store", [False, True])
+def test_large_request_and_response_are_saved_and_replayed_in_full(http_origin, tmp_path, use_store):
+    import hashlib
+    url, seen = http_origin
+    raw = b"\x00large-full-body\xff" * 90_000 + b"TAIL_AFTER_ONE_MIB"
+    bodies = BodyStore(tmp_path) if use_store else None
+    record = request_record(url + "/full", raw)
+    if bodies is not None:
+        record.update(bodies.snapshot("request", raw, raw.decode("utf-8", "replace")))
+    result = replay_http(record, {}, bodies)
+    assert result["state"] == "replayed", result
+    assert result["status_code"] == 201
+    assert result["request_truncated"] is False
+    assert result["response_truncated"] is False
+    assert result["request_body_complete"] is True
+    assert result["response_body_complete"] is True
+    assert base64.b64decode(seen[0]["body_b64"]) == raw
+    if bodies is not None:
+        assert result["request_body_ref"] == hashlib.sha256(raw).hexdigest()
+        assert bodies.read_body(result, "request") == raw
+        response = json.loads(bodies.read_text(result, "response"))
+        assert len(result["response_body_text"].encode()) <= 64 * 1024
+        assert result["response_preview_truncated"] is True
+    else:
+        assert base64.b64decode(result["request_body_b64"]) == raw
+        response = json.loads(result["response_body_text"])
+    assert base64.b64decode(response["body_b64"]) == raw
+
+
+def test_large_text_and_binary_edits_are_not_restricted_to_one_mib(http_origin, tmp_path):
+    url, seen = http_origin
+    bodies = BodyStore(tmp_path)
+    text = "完整编辑" * 100_000 + "TEXT_TAIL_AFTER_ONE_MIB"
+    assert len(text.encode()) > 1024 * 1024
+    result = replay_http(request_record(url), {"body_text": text}, bodies)
+    assert result["state"] == "replayed"
+    assert base64.b64decode(seen[-1]["body_b64"]) == text.encode()
+    assert bodies.read_text(result, "request") == text
+    raw = b"\x00\xff" * 600_000 + b"BINARY_TAIL_AFTER_ONE_MIB"
+    result = replay_http(request_record(url), {"body_b64": base64.b64encode(raw).decode()}, bodies)
+    assert result["state"] == "replayed"
+    assert base64.b64decode(seen[-1]["body_b64"]) == raw
+    assert bodies.read_body(result, "request") == raw
+
+
+def test_compressed_response_retains_raw_encoding_and_full_decoded_text(http_origin, tmp_path):
+    url, seen = http_origin
+    bodies = BodyStore(tmp_path)
+    raw = b"full-compressed-body-" * 65_000 + b"COMPRESSED_RESPONSE_TAIL"
+    result = replay_http(request_record(url + "/compressed-response", raw), {}, bodies)
+    assert result["state"] == "replayed"
+    assert result["response_body_complete"] is True
+    response_raw = bodies.read_body(result, "response")
+    response_text = bodies.read_text(result, "response")
+    assert gzip.decompress(response_raw).decode() == response_text
+    assert base64.b64decode(json.loads(response_text)["body_b64"]) == raw
+    assert result["response_body_size"] < 64 * 1024
+    assert result["response_preview_truncated"] is True
+    assert any(k.lower() == "content-encoding" and v == "gzip" for k, v in result["response_headers"])
+
+
+def test_interrupted_response_is_explicitly_incomplete_and_keeps_received_bytes(http_origin, tmp_path):
+    url, _ = http_origin
+    bodies = BodyStore(tmp_path)
+    result = replay_http(request_record(url + "/incomplete"), {}, bodies)
+    assert result["state"] == "error"
+    assert result["status_code"] == 201
+    assert result["request_body_complete"] is True
+    assert result["response_body_complete"] is False
+    assert result["response_truncated"] is True
+    assert "complete" in result["response_body_error"]
+    assert bodies.read(result["response_body_ref"])
+
+
+def test_response_disk_failure_is_not_marked_complete(http_origin, tmp_path):
+    url, _ = http_origin
+
+    class FailingResponseStore(BodyStore):
+        def snapshot(self, prefix, raw, text):
+            if prefix == "response":
+                raise OSError("disk full while saving response")
+            return super().snapshot(prefix, raw, text)
+
+    result = replay_http(request_record(url), {}, FailingResponseStore(tmp_path))
+    assert result["state"] == "error"
+    assert result["request_body_complete"] is True
+    assert result["response_body_complete"] is False
+    assert result["response_truncated"] is True
+    assert result["response_body_ref"] is None
+    assert result["response_body_size"] > 0
+    assert "disk full" in result["response_body_error"]
+
+
+def test_missing_body_file_cannot_silently_replay_preview(tmp_path):
+    bodies = BodyStore(tmp_path)
+    raw = b"x" * 100_000 + b"FILE_TAIL"
+    record = request_record()
+    record.update(bodies.snapshot("request", raw, raw.decode()))
+    bodies.path(record["request_body_ref"]).unlink()
+    with pytest.raises(ValueError, match="完整请求正文"):
+        request_parts(record, {}, bodies)
+    assert request_parts(record, {"body_text": "explicit replacement"}, bodies)[3] == b"explicit replacement"
+
+
+def test_file_body_without_store_cannot_silently_replay_preview(tmp_path):
+    bodies = BodyStore(tmp_path)
+    record = request_record()
+    record.update(bodies.snapshot("request", b"x" * 100_000, "x" * 100_000))
+    with pytest.raises(ValueError, match="正文存储"):
+        request_parts(record, {})
+
+
+def test_failed_capture_cannot_replay_partial_bytes():
+    record = request_record()
+    record["request_body_complete"] = False
+    with pytest.raises(ValueError, match="截断"):
+        request_parts(record, {})
 
 
 def test_http_text_edit_updates_charset_and_removes_old_compression(http_origin):

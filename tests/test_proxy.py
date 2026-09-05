@@ -9,6 +9,7 @@ import pytest
 
 from requestwatch import proxy_addon as addon_module
 from requestwatch.proxy import ProxyProcess
+from requestwatch.body_store import BodyStore
 from requestwatch.proxy_addon import RequestWatchAddon, body_snapshot, edited_request, validate_url
 
 
@@ -128,14 +129,93 @@ def test_invalid_edits_leave_live_request_unchanged(edits):
     assert request.raw_content == b"original\x00binary"
 
 
-def test_capture_limit_does_not_truncate_live_body(monkeypatch):
-    monkeypatch.setattr(addon_module, "MAX_BODY_BYTES", 5)
-    request = Request(b"abcdefghijk")
-    result = body_snapshot(request, "request")
+def test_capture_preview_does_not_truncate_saved_or_live_body(tmp_path):
+    import hashlib
+    raw = ("完整正文 ".encode("utf-8") * 120_000) + b"TAIL_AFTER_ONE_MIB"
+    request = Request(raw)
+    bodies = BodyStore(tmp_path)
+    result = body_snapshot(request, "request", bodies)
+    assert result["request_truncated"] is False
+    assert result["request_body_complete"] is True
+    assert result["request_preview_truncated"] is True
+    assert result["request_body_size"] == len(raw)
+    assert len(result["request_body_text"].encode("utf-8")) <= 64 * 1024
+    assert not result.get("request_body_b64")
+    assert result["request_body_ref"] == hashlib.sha256(raw).hexdigest()
+    assert bodies.read_body(result, "request") == raw
+    assert bodies.read_text(result, "request").endswith("TAIL_AFTER_ONE_MIB")
+    assert request.raw_content == raw
+
+
+def test_inline_snapshot_does_not_truncate_without_store():
+    raw = b"x" * (1024 * 1024 + 7) + b"TAIL"
+    result = body_snapshot(Request(raw), "request")
+    assert result["request_body_complete"] is True
+    assert result["request_truncated"] is False
+    assert base64.b64decode(result["request_body_b64"]) == raw
+    assert result["request_body_text"].endswith("TAIL")
+
+
+def test_absent_streamed_body_is_not_reported_as_complete(tmp_path):
+    result = body_snapshot(Request(None), "request", BodyStore(tmp_path))
+    assert result["request_body_complete"] is False
     assert result["request_truncated"] is True
-    assert result["request_body_size"] == 11
-    assert base64.b64decode(result["request_body_b64"]) == b"abcde"
-    assert request.raw_content == b"abcdefghijk"
+    assert "unavailable" in result["request_body_error"]
+
+
+def test_body_storage_failure_keeps_request_forwarding_and_marks_incomplete():
+    class UnwritableStore:
+        def snapshot(self, *args):
+            raise OSError("disk full")
+
+    async def run():
+        addon = RequestWatchAddon(body_store=UnwritableStore())
+        addon._api = AsyncMock(return_value={"id": "flow-1", "state": "captured"})
+        addon._update = AsyncMock()
+        item = flow()
+        original = item.request
+        await addon.request(item)
+        await asyncio.gather(*addon._tasks)
+        record = addon._api.call_args.args[2]
+        assert record["request_body_complete"] is False
+        assert record["request_truncated"] is True
+        assert record["request_body_ref"] is None
+        assert "disk full" in record["request_body_error"]
+        assert item.request is original
+        assert item.response is None
+        assert addon._update.call_args.args[1]["state"] == "forwarded"
+    asyncio.run(run())
+
+
+def test_disk_save_is_not_limited_by_management_api_timeout(tmp_path, monkeypatch):
+    import time
+    monkeypatch.setattr(addon_module, "API_OUTAGE_SECONDS", 0.01)
+
+    class SlowStore(BodyStore):
+        def snapshot(self, *args):
+            time.sleep(0.04)
+            return super().snapshot(*args)
+
+    async def run():
+        bodies = SlowStore(tmp_path)
+        addon = RequestWatchAddon(body_store=bodies)
+        addon._api = AsyncMock(return_value={"id": "flow-1", "state": "captured"})
+        addon._update = AsyncMock()
+        item = flow()
+        ticks = []
+
+        async def concurrent_work():
+            for _ in range(3):
+                await asyncio.sleep(0.005)
+                ticks.append(1)
+
+        await asyncio.gather(addon.request(item), concurrent_work())
+        await asyncio.gather(*addon._tasks)
+        record = addon._api.call_args.args[2]
+        assert record["request_body_complete"] is True
+        assert bodies.read_body(record) == item.request.raw_content
+        assert len(ticks) == 3
+    asyncio.run(run())
 
 
 def test_pause_timeout_is_nonblocking_and_releases_original():
@@ -227,16 +307,26 @@ def test_proxy_missing_binary_is_reported_without_crashing(tmp_path, monkeypatch
     process.stop()
 
 
-def test_real_mitmproxy_preserves_compression_and_repeated_headers():
+def test_real_mitmproxy_preserves_compression_and_repeated_headers(tmp_path):
     mitm_http = pytest.importorskip("mitmproxy.http")
     import gzip
     request = mitm_http.Request.make("POST", "https://example.com/old", content=b"old",
                                      headers={"Content-Type": "text/plain; charset=utf-8"})
     request.headers["content-encoding"] = "gzip"
-    request.content = b"old compressed body"
+    decoded = b"old compressed body" * 80_000 + b"COMPRESSED_TAIL_AFTER_ONE_MIB"
+    request.content = decoded
     request.headers.add("X-Repeat", "one")
     request.headers.add("X-Repeat", "two")
     original = request.raw_content
+    bodies = BodyStore(tmp_path)
+    snapshot = body_snapshot(request, "request", bodies)
+    assert len(original) < 64 * 1024
+    assert len(decoded) > 1024 * 1024
+    assert snapshot["request_body_complete"] is True
+    assert snapshot["request_truncated"] is False
+    assert snapshot["request_preview_truncated"] is True
+    assert bodies.read_body(snapshot) == original
+    assert bodies.read_text(snapshot, "request").encode() == decoded
     unchanged = edited_request(request, {"url": "https://new.example/new"})
     assert unchanged.raw_content == original
     assert unchanged.host_header == "new.example"
@@ -247,8 +337,21 @@ def test_real_mitmproxy_preserves_compression_and_repeated_headers():
     assert request.raw_content == original
 
 
+def test_real_mitmproxy_decode_failure_preserves_raw_bytes(tmp_path):
+    mitm_http = pytest.importorskip("mitmproxy.http")
+    raw = b"not-a-valid-gzip-stream"
+    request = mitm_http.Request.make("POST", "https://example.com/bad-compression", content=raw)
+    request.headers["content-encoding"] = "gzip"
+    bodies = BodyStore(tmp_path)
+    result = body_snapshot(request, "request", bodies)
+    assert result["request_body_complete"] is True
+    assert result["request_body_binary"] is True
+    assert result["request_body_decode_error"]
+    assert bodies.read_body(result) == raw
+
+
 @pytest.mark.parametrize("use_tls", [False, True])
-def test_live_proxy_roundtrip(tmp_path, use_tls):
+def test_live_proxy_roundtrip(tmp_path, use_tls, monkeypatch):
     """Opt-in real mitmdump test: RW_RUN_PROXY_INTEGRATION=1 python -m pytest ...
 
     Runs only on loopback, using ephemeral HTTP origin/API servers. No Docker,
@@ -268,6 +371,8 @@ def test_live_proxy_roundtrip(tmp_path, use_tls):
     records = {}
     seen = []
     expected_token = "integration-test-token"
+    large_body = b"captured-full-body-" * 70_000 + b"TAIL_AFTER_ONE_MIB"
+    bodies = BodyStore(tmp_path)
 
     class QuietHandler(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -364,12 +469,14 @@ def test_live_proxy_roundtrip(tmp_path, use_tls):
             edited = client.get(origin_url + "/edit").json()
             assert edited == {"method": "POST", "path": "/edit", "body": "edited payload"}
             assert client.get(origin_url + "/drop").status_code == 499
+            large_response = client.post(origin_url + "/large", content=large_body)
+            assert large_response.json()["body"].encode() == large_body
         deadline = time.monotonic() + 5
-        while not (len(records) == 3 and all(r.get("status_code") for r in records.values())):
+        while not (len(records) == 4 and all(r.get("status_code") for r in records.values())):
             if time.monotonic() >= deadline:
                 pytest.fail("Missing capture updates: " + repr(records))
             time.sleep(0.02)
-        assert [r["path"] for r in seen] == ["/capture", "/edit"]
+        assert [r["path"] for r in seen] == ["/capture", "/edit", "/large"]
         dropped = next(r for r in records.values() if urlsplit(r["url"]).path == "/drop")
         assert dropped["state"] == "dropped"
         assert dropped["status_code"] == 499
@@ -377,6 +484,29 @@ def test_live_proxy_roundtrip(tmp_path, use_tls):
         assert captured["response_body_text"]
         assert captured["state"] == "forwarded"
         assert captured["protocol"] == ("HTTPS" if use_tls else "HTTP")
+        large = next(r for r in records.values() if urlsplit(r["url"]).path == "/large")
+        assert large["request_body_complete"] is True
+        assert large["response_body_complete"] is True
+        assert large["request_truncated"] is False
+        assert large["response_truncated"] is False
+        assert large["request_preview_truncated"] is True
+        assert large["response_preview_truncated"] is True
+        assert len(large["request_body_text"].encode()) <= 64 * 1024
+        assert bodies.read_body(large, "request") == large_body
+        assert bodies.read_body(large, "response") == large_response.content
+        assert json.loads(bodies.read_text(large, "response"))["body"].encode() == large_body
+        from requestwatch.replay import replay_http
+        original_client = httpx.Client
+        with monkeypatch.context() as patch:
+            if use_tls:
+                trusted = ssl.create_default_context(cafile=str(tmp_path / "origin-ca.pem"))
+                patch.setattr(httpx, "Client", lambda *args, **kwargs: original_client(*args, **kwargs, verify=trusted))
+            replayed = replay_http(large, {}, bodies)
+        assert replayed["state"] == "replayed", replayed.get("error")
+        assert replayed["response_body_complete"] is True
+        assert seen[-1]["body"].encode() == large_body
+        assert bodies.read_body(replayed, "request") == large_body
+        assert json.loads(bodies.read_text(replayed, "response"))["body"].encode() == large_body
     finally:
         process.stop()
         api.shutdown()
@@ -465,6 +595,8 @@ def tls_origin_context(tmp_path):
                .not_valid_before(now - datetime.timedelta(minutes=1))
                .not_valid_after(now + datetime.timedelta(days=1))
                .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+               .add_extension(x509.SubjectKeyIdentifier.from_public_key(ca_key.public_key()), critical=False)
+               .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()), critical=False)
                .add_extension(x509.KeyUsage(digital_signature=True, key_encipherment=False,
                                             key_cert_sign=True, crl_sign=True, content_commitment=False,
                                             data_encipherment=False, key_agreement=False,
@@ -477,6 +609,12 @@ def tls_origin_context(tmp_path):
                  .not_valid_before(now - datetime.timedelta(minutes=1))
                  .not_valid_after(now + datetime.timedelta(days=1))
                  .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+                 .add_extension(x509.SubjectKeyIdentifier.from_public_key(leaf_key.public_key()), critical=False)
+                 .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()), critical=False)
+                 .add_extension(x509.KeyUsage(digital_signature=True, key_encipherment=False,
+                                              key_cert_sign=False, crl_sign=False, content_commitment=False,
+                                              data_encipherment=False, key_agreement=False,
+                                              encipher_only=False, decipher_only=False), critical=True)
                  .add_extension(x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]), critical=False)
                  .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
                  .sign(ca_key, hashes.SHA256()))

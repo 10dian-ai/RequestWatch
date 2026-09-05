@@ -17,7 +17,9 @@ class ProxyProcess:
         self._log_file = None
 
     def _executable(self) -> str | None:
-        override = os.getenv("RW_MITMDUMP")
+        override = getattr(self.config, "mitmdump", None)
+        if override is None:
+            override = os.getenv("RW_MITMDUMP")
         if override:
             return shutil.which(override) or (override if Path(override).is_file() else None)
         candidate = Path(sys.executable).parent / ("mitmdump.exe" if os.name == "nt" else "mitmdump")

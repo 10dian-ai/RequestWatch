@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import threading
 import time
 import uuid
@@ -8,8 +9,9 @@ from .rules import matches
 
 
 class Runtime:
-    def __init__(self, store, config, inventory=None):
+    def __init__(self, store, config, inventory=None, streams=None):
         self.store, self.config, self.inventory = store, config, inventory
+        self.streams = streams
         self._pending: dict[str, dict] = {}
         self._lock = threading.RLock()
         self._rules = store.rules()
@@ -30,9 +32,17 @@ class Runtime:
         record.setdefault("state", "captured")
         if self.inventory and not record.get("container_id") and record.get("attribution") != "host-replay":
             record.update(self.inventory.identify(record.get("src_ip", ""), record.get("dst_ip", "")))
+        if self.streams and record.get("source") == "packet" and record.get("protocol") == "TCP":
+            try:
+                session_id = self.streams.ingest(record)
+                if session_id:
+                    record["tcp_session_id"] = session_id
+            except Exception as exc:
+                logging.getLogger(__name__).exception("TCP session capture failed")
+                record["tcp_session_error"] = str(exc)
         with self._lock:
             if can_intercept:
-                rule = next((r for r in self._rules if matches(r, record)), None)
+                rule = next((r for r in self._rules if matches(r, record, self.store.bodies)), None)
                 if rule and len(self._pending) < self.config.pending_limit:
                     seconds = rule["timeout_seconds"]
                     record.update(state="pending", rule_id=rule["id"], rule_name=rule["name"], timeout_seconds=seconds,
@@ -40,7 +50,12 @@ class Runtime:
                     self._pending[record["id"]] = {"deadline": time.monotonic() + seconds, "decision": None}
                 elif rule:
                     record["detail"] = "等待队列已满，已自动放行"
-            return self.store.save(record)
+            try:
+                return self.store.save(record)
+            except Exception:
+                # A failed persistence cannot leave an unpollable queue slot behind.
+                self._pending.pop(record["id"], None)
+                raise
 
     def update(self, record_id: str, changes: dict):
         with self._lock:
@@ -86,6 +101,6 @@ class Runtime:
                 from .demo import apply_demo_edits
                 record = self.store.get(record_id)
                 if record and decision["action"] == "accept":
-                    self.store.save(apply_demo_edits(record, decision.get("edits", {})))
+                    self.store.save(apply_demo_edits(record, decision.get("edits", {}), self.store.bodies))
                 self.update(record_id, {"state": "dropped" if decision["action"] == "drop" else "forwarded",
                                         "detail": "演示操作：未发送真实网络流量", "modified": bool(decision["edits"])})

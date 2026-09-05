@@ -7,6 +7,8 @@ import time
 import uuid
 from pathlib import Path
 
+from .body_store import BodyStore
+
 
 def searchable(record: dict) -> str:
     keys = ("protocol", "summary", "src_ip", "dst_ip", "container_name", "container_id",
@@ -17,8 +19,9 @@ def searchable(record: dict) -> str:
 
 
 class Store:
-    def __init__(self, path: Path | str, max_records: int = 10000):
+    def __init__(self, path: Path | str, max_records: int = 10000, body_dir: Path | str | None = None):
         self.lock = threading.RLock()
+        self.bodies = BodyStore(body_dir if body_dir is not None else Path(path).parent)
         self.db = sqlite3.connect(str(path), check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.max_records = max_records
@@ -42,7 +45,7 @@ class Store:
                 self.db.execute("UPDATE records SET state='error',data=? WHERE id=?", (json.dumps(record, ensure_ascii=False), row["id"]))
 
     def save(self, record: dict) -> dict:
-        record = dict(record)
+        record = self.bodies.externalize(record)
         record.setdefault("id", uuid.uuid4().hex)
         record.setdefault("created_at", time.time())
         record.setdefault("state", "captured")
@@ -70,6 +73,14 @@ class Store:
             record = self.get(record_id)
             if record is None:
                 return None
+            for prefix in ("request", "response"):
+                if any(prefix + suffix in changes for suffix in ("_body_text", "_body_b64")) and prefix + "_body_ref" not in changes:
+                    for suffix in ("_body_ref", "_text_ref", "_body_complete", "_truncated", "_body_size"):
+                        record.pop(prefix + suffix, None)
+                    if prefix + "_body_b64" not in changes:
+                        record.pop(prefix + "_body_b64", None)
+                    if prefix + "_body_b64" in changes and prefix + "_body_text" not in changes:
+                        record.pop(prefix + "_body_text", None)
             record.update({k: v for k, v in changes.items() if k not in {"id", "created_at"}})
             return self.save(record)
 
@@ -82,13 +93,31 @@ class Store:
         if container_id and container_id != "any":
             clauses.append("(container_id=? OR json_extract(data,'$.src_container_id')=? OR json_extract(data,'$.dst_container_id')=?)")
             values.extend([container_id] * 3)
-        if q:
-            clauses.append("search_text LIKE ? ESCAPE '\\'")
-            values.append("%" + q.casefold().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%")
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
-        with self.lock:
-            total = self.db.execute("SELECT COUNT(*) FROM records" + where, values).fetchone()[0]
-            rows = self.db.execute("SELECT data FROM records" + where + " ORDER BY created_at DESC LIMIT ? OFFSET ?", (*values, limit, offset)).fetchall()
+        if q:
+            # Snapshot metadata briefly; large file searches must not block capture/verdict writes.
+            with self.lock:
+                candidate_ids = [r[0] for r in self.db.execute("SELECT id FROM records" + where + " ORDER BY created_at DESC", values)]
+            rows, total = [], 0
+            needle = q.casefold()
+            for start in range(0, len(candidate_ids), 32):
+                batch = candidate_ids[start:start + 32]
+                with self.lock:
+                    fetched = self.db.execute("SELECT data,search_text,id FROM records WHERE id IN (" + ",".join("?" for _ in batch) + ")", batch).fetchall()
+                by_id = {r[2]: r for r in fetched}
+                for record_id in batch:
+                    candidate = by_id.get(record_id)
+                    if candidate is None:  # Retention may evict records during a long search.
+                        continue
+                    item = json.loads(candidate[0])
+                    if needle in candidate[1] or self.bodies.contains(item, needle):
+                        if offset <= total < offset + limit:
+                            rows.append(candidate)
+                        total += 1
+        else:
+            with self.lock:
+                total = self.db.execute("SELECT COUNT(*) FROM records" + where, values).fetchone()[0]
+                rows = self.db.execute("SELECT data FROM records" + where + " ORDER BY created_at DESC LIMIT ? OFFSET ?", (*values, limit, offset)).fetchall()
         items = []
         for row in rows:
             item = json.loads(row[0])
@@ -118,6 +147,25 @@ class Store:
     def delete_rule(self, rule_id: str) -> bool:
         with self.lock, self.db:
             return self.db.execute("DELETE FROM rules WHERE id=?", (rule_id,)).rowcount > 0
+
+    def gc_bodies(self, grace_seconds=600):
+        """Evict blobs after record retention; grace protects proxy writes before ingest."""
+        with self.lock:
+            live = set()
+            for row in self.db.execute("SELECT data FROM records"):
+                record = json.loads(row[0])
+                for prefix in ("request", "response"):
+                    for kind in ("body", "text"):
+                        if ref := record.get(prefix + "_" + kind + "_ref"):
+                            live.add(ref)
+        cutoff = time.time() - grace_seconds
+        for path in self.bodies.root.glob("*.blob"):
+            if path.stem not in live and not path.is_symlink():
+                try:
+                    if path.stat().st_mtime < cutoff:
+                        path.unlink()
+                except FileNotFoundError:
+                    pass
 
     def close(self):
         with self.lock:

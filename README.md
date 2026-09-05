@@ -20,16 +20,16 @@ curl -fsSL https://raw.githubusercontent.com/10dian-ai/RequestWatch/main/scripts
 sudo cat /var/lib/requestwatch/admin-token
 ```
 
-脚本下载本仓库源码，安装运行依赖，配置 systemd 并启动服务；重复执行可更新程序，保留已有配置、数据库和 CA。默认代理只监听本机8080，Docker容器接入方法见后文。需要服务器能访问 GitHub 和 Ubuntu/PyPI 软件源。
+脚本下载本仓库源码，安装运行依赖，配置 systemd 并启动服务；重复执行可更新程序，保留已有配置、数据库和 CA。默认代理只监听本机8080，安装后在面板「项目设置」调整，无需逐项编辑 SSH 配置；Docker容器接入方法见后文。需要服务器能访问 GitHub 和 Ubuntu/PyPI 软件源。
 
 如需固定版本，可把安装命令末尾改为 `sudo env RW_REF=<分支名或版本标签或commit> bash`。这固定下载的项目源码版本；引导脚本本身仍来自命令中指定的 main。
 
-## 第一版能力
+## 当前能力
 
 | 能力 | TCP / UDP 原始包 | HTTP / HTTPS 代理 |
 | --- | --- | --- |
-| 捕获与查看 | IPv4 / IPv6 TCP、UDP，载荷文本和 HEX | 方法、URL、请求头、正文、响应、状态码 |
-| 内容搜索 | 当前捕获包内可解码的文本 | URL、头、解码后的请求与响应正文 |
+| 捕获与查看 | IPv4 / IPv6 TCP、UDP；TCP 按连接和方向重组，全文及 HEX | 完整方法、URL、请求头、请求/响应正文、状态码 |
+| 内容搜索 | 原始包内文本；TCP 会话全文支持跨包匹配 | URL、头、完整解码正文，包括大正文末尾 |
 | 容器筛选 | 按源/目标容器 IP 归属 | 按连接到代理的客户端 IP 归属 |
 | 规则暂停 | 容器、目标 IP/CIDR、端口、包内关键词 | 容器、目标主机、端口、请求关键词 |
 | 编辑后放行 | TCP 等长载荷修改；UDP 更新长度/校验和 | 支持修改方法、URL、重复请求头和正文 |
@@ -52,13 +52,15 @@ sudo cat /var/lib/requestwatch/admin-token
 
 脚本安装到 /opt/requestwatch，创建 Python 虚拟环境和 systemd 服务。数据、CA 私钥及令牌存放于 /var/lib/requestwatch。现有配置和数据在重新安装时保留。
 
-```bash
-sudoedit /etc/requestwatch/requestwatch.env
-sudo systemctl restart requestwatch
-sudo journalctl -u requestwatch -f
-```
+打开面板左侧 **「项目设置」**，修改后点击 **「保存设置」→「重启服务并应用」**。面板会列出待应用字段，应用前检查监听地址/端口；监听地址变更后给出新的访问链接；若新配置启动失败，会自动恢复上次可用设置，回到原地址和原令牌。
 
-默认排除 22、7030、8080 的双向网络流量，防止 SSH 和管理/代理流量进入原始抓包反馈循环。**SSH 使用其他端口时，请先在 RW_PROTECTED_PORTS 中追加该端口。** 保护范围不阻止你在 HTTP 代理内调试其他应用的 HTTPS 请求。
+可调整：Web 监听地址/端口、管理令牌、抓包开关、网卡、NFQUEUE 编号、额外保护端口、等待数量、规则默认超时、代理开关/地址/端口/认证、mitmdump 路径、记录保留数量和 TCP 会话空闲时间。访问令牌支持在面板生成与轮换，代理认证支持明确清除；查询接口不返回这些秘密的明文。
+
+设置保存在 `/var/lib/requestwatch/settings.json`，覆盖环境变量和命令行的初始值，升级保留。点击应用后程序先停止现有网络引擎并重载配置；当前连接可能中断，待处理记录在重启后失效。通过一键安装或 `requestwatch` / `python -m requestwatch` 启动时均支持面板重启。演示设置独立保存且只模拟应用。
+
+安装程序的目录、数据根目录和 systemd 系统约束属于部署布局，面板只读显示数据路径；不会在修改运行参数时搬迁捕获数据。目标程序的代理设置与 CA 信任须在目标运行环境配置，接入指南提供可复制内容和证书下载。
+
+默认排除 22、7030、8080 的双向网络流量，防止 SSH 和管理/代理流量进入原始抓包反馈循环。**SSH 使用其他端口时，请先在面板「项目设置 → 额外保护端口」中追加该端口。** 保护范围不阻止你在 HTTP 代理内调试其他应用的 HTTPS 请求。
 
 ### 手动安装 / 开发
 
@@ -80,7 +82,7 @@ python -m venv .venv
 .venv/bin/python -m requestwatch --demo --port 7030
 ```
 
-演示令牌位于 data/admin-token。页面明确显示演示标识。创建一条规则后，使用「生成匹配演示请求」体验暂停、编辑、放行、丢弃；演示重发只创建模拟记录。演示数据库与真实数据库分开。
+演示令牌位于 data/demo/admin-token。页面明确显示演示标识。创建一条规则后，使用「生成匹配演示请求」体验暂停、编辑、放行、丢弃；演示重发只创建模拟记录。演示数据库与真实数据库分开。
 
 ## 配置 HTTP / HTTPS
 
@@ -110,8 +112,8 @@ curl --proxy http://127.0.0.1:8080 --cacert /tmp/requestwatch-ca.crt https://exa
 
 ### Docker 容器
 
-1. 将 /etc/requestwatch/requestwatch.env 中的 RW_PROXY_HOST 改为可达的宿主机 bridge 地址，或 0.0.0.0。
-2. 重启 requestwatch。
+1. 在面板「项目设置 → HTTP 代理」把监听地址设为可达的宿主机 bridge 地址，或 0.0.0.0。
+2. 点击「保存设置」和「重启服务并应用」。
 3. 给目标容器配置代理和证书。以下片段合并到**目标应用**的 Compose 文件中：
 
 ```yaml
@@ -135,7 +137,7 @@ services:
 
 此片段只解决接入配置，不会自动把证书安装到 Java、浏览器等独立信任库。需要镜像级信任时，参阅 [Docker 官方 CA 文档](https://docs.docker.com/engine/network/ca-certs/)。
 
-代理可被其他设备访问时，设置 RW_PROXY_AUTH=user:password 并限制防火墙来源。目标客户端代理 URL 需包含对应用户名/密码，特殊字符需 URL 编码。7030 的管理令牌与代理认证是两套独立凭据。
+代理可被其他设备访问时，在面板填写代理认证 `user:password` 并限制防火墙来源。目标客户端代理 URL 需包含对应用户名/密码，特殊字符需 URL 编码。7030 的管理令牌与代理认证是两套独立凭据。
 
 ## 操作流程
 
@@ -144,9 +146,19 @@ services:
 3. 在「拦截规则」创建窄范围规则。原始包目标地址支持 IP/CIDR；HTTP 支持目标主机文字匹配。
 4. 命中规则后打开「拦截队列」，选择记录。直接放行或编辑后放行；丢弃则终止对应包/HTTP 请求。
 5. 已处理记录可以「重发请求」。HTTP 重发支持编辑完整请求；TCP/UDP 重发只发送所选应用载荷。
-6. 页面每 2 秒刷新，可暂停刷新；刷新不会覆盖尚未提交的编辑草稿。记录可以导出 JSON。
+6. 请求/响应页自动加载完整正文，支持下载原始字节和重建的完整 HTTP 消息；HEX 可分页并跳转至任意位置。JSON 导出是元数据与预览，完整正文请用正文或 HTTP 下载。
+7. 打开「TCP 会话」按容器和全文关键词筛选，分别查看客户端→服务端与服务端→客户端内容；原始 TCP 包也可跳转到所属会话。
+8. 页面每 2 秒刷新，可暂停刷新；刷新不会覆盖尚未提交的编辑草稿。
 
-响应正文支持搜索，但**请求发送前的暂停规则不能匹配未来尚未收到的响应**。原始包关键词不会跨 TCP 分段重组；需要完整 HTTP 请求/响应时使用代理路径。
+响应正文支持搜索，但**请求发送前的暂停规则不能匹配未来尚未收到的响应**。TCP 会话搜索会跨包匹配，原始包暂停规则仍逐包匹配；通用 TCP 连接没有统一的“请求结束”定义。需要在完整 HTTP 请求发送前编辑时，使用 HTTP/HTTPS 代理路径。
+
+### 完整内容如何保存
+
+- HTTP/HTTPS 原始正文和解码全文按内容哈希保存到 `body_blobs/`，取消旧版每项 1 MiB 的截断。数据库只保留 64 KiB 预览，详情页自动加载全文，编辑和重发使用完整文件；二进制上传、压缩正文保留原始字节。
+- HTTP 下载包含起始行、全部已记录请求头和正文，重建为 HTTP/1.1 形式并修正长度/分块头，尾部头合并为头字段；HTTP/2 帧、原始分块边界不属于该导出。原协议版本和尾部头仍保存在元数据中。
+- TCP 会话按序列号重组双向内容，处理乱序和重传；相同序号内容冲突时保留先观察到的字节并显示冲突。只有观察到双向 SYN/FIN 且无缺口、截断或冲突时标记连接完整。这不代表目标程序确认收到了所有内容。
+- 若抓取从连接中途开始、丢包或 IP 分片无法重组，页面明确显示不完整。TCP 导出仅包含观察到的字节，按序号排列，缺口省略且在详情列明，不能把省略后的连续文本当作实际线上连续内容。加密会话仍显示密文。
+- 旧版本已截掉的内容无法补回，需要重新抓取。磁盘写入失败、传输中断不会标记为完整。
 
 ## 范围和实际限制
 
@@ -158,10 +170,12 @@ services:
 - TCP 原始包丢弃不是取消应用请求；发送方可能再次重传。TCP 载荷重发不是原连接恢复，不复用原序列号、TLS 握手或容器身份。新连接的结果取决于应用协议；UDP 也可能因认证或状态要求不能独立重发。
 - 抓取宿主机可见的网络接口并动态识别新增接口。容器内部 loopback 不经过宿主机网络；某些 bridge 路径是否经过 Netfilter 依赖 br_netfilter 配置。此类路径不承诺全部可见。
 - 容器归属基于 Docker 公共网络 IP。host 网络、共享 IP、rootless Docker、NAT 后地址及跨命名空间路径可能显示「未知来源」；不会伪造精确归属。Docker socket 查询只读，但进程按用户选择以 root 运行。
-- HTTP 正文保存原始字节和解码文本，各自最多 1 MiB，并显示截断标识；完整代理流仍由 mitmproxy 转发。截断正文重发需提供完整替换内容。长连接/WebSocket消息并未单独解析。
-- 默认保留最近 10000 条记录，SQLite 复用已分配空间。数据库包含捕获到的正文和请求头，应按你的数据需求管理 /var/lib/requestwatch。
+- HTTP 正文无固定 1 MiB 保存上限，实际受可用磁盘与内存限制。代理需要缓冲完整 HTTP 消息用于修改，浏览器全文视图也会占用内存；响应需接收结束才有完整正文。WebSocket 消息、无限 SSE 流未单独解析。
+- 默认保留最近 10000 条记录和最近 10000 个 TCP 会话；会话 5 分钟无包后再次出现会另起会话。正文文件在所属记录淘汰后延迟至少 10 分钟清理；TCP 会话文件随会话淘汰。数量上限并非磁盘容量上限，长会话和大正文仍会占用大量空间。SQLite 复用已分配空间，数据保存在 /var/lib/requestwatch。
 
 ## 配置项
+
+日常配置使用 Web「项目设置」。下表列出初次启动的环境默认值；面板保存的设置优先。
 
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -173,7 +187,10 @@ services:
 | RW_INTERFACES | any | 全部接口，或逗号分隔的接口名 |
 | RW_QUEUE_NUM | 7030 | 独占NFQUEUE编号 |
 | RW_PROTECTED_PORTS | 22 | 排除端口，自动追加Web/代理端口 |
-| RW_MAX_RECORDS | 10000 | 记录保留上限，至少100 |
+| RW_MAX_RECORDS | 10000 | 记录及TCP会话各自保留上限，至少100 |
+| RW_PENDING_LIMIT | 128 | 等待拦截决定的数量上限 |
+| RW_DEFAULT_TIMEOUT | 30 | 新规则默认等待秒数 |
+| RW_TCP_IDLE_TIMEOUT | 300 | 会话无包后再次出现时另起会话的秒数 |
 | RW_PROXY | true | 启用HTTP/HTTPS代理 |
 | RW_PROXY_HOST | 127.0.0.1 | 代理监听地址 |
 | RW_PROXY_PORT | 8080 | 代理端口 |
@@ -222,6 +239,9 @@ sudo env RW_QUEUE_NUM=7030 python3 /opt/requestwatch/scripts/cleanup_firewall.py
 - requestwatch/app.py：7030 Web/API、认证、控制接口
 - requestwatch/runtime.py / store.py / rules.py：拦截生命周期、SQLite、组合规则
 - requestwatch/network.py：被动捕获与 NFQUEUE
+- requestwatch/body_store.py：完整HTTP正文文件
+- requestwatch/settings.py：面板设置校验、脱敏及原子保存
+- requestwatch/tcp_streams.py：持久化TCP双向序列重组及全文搜索
 - requestwatch/dockerinfo.py：Docker 容器归属
 - requestwatch/proxy.py / proxy_addon.py：mitmproxy 进程及 HTTP/HTTPS 捕获
 - requestwatch/replay.py：HTTP/TCP/UDP 新连接重发

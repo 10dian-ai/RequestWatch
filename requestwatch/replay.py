@@ -10,7 +10,6 @@ from urllib.parse import urlsplit
 import httpx
 
 
-MAX_BODY = 1024 * 1024
 HOP_HEADERS = {"connection", "proxy-connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "proxy-authorization", "proxy-authenticate", "content-length", "host"}
 
 
@@ -36,17 +35,15 @@ def validate_http_edits(edits: dict) -> dict:
         raise ValueError("HTTP 方法无效")
     if "body_text" in edits and "body_b64" in edits:
         raise ValueError("正文不能同时使用文本和 Base64")
-    if "body_text" in edits and (not isinstance(edits["body_text"], str) or len(edits["body_text"].encode()) > MAX_BODY):
-        raise ValueError("编辑正文不能超过 1 MiB")
+    if "body_text" in edits and not isinstance(edits["body_text"], str):
+        raise ValueError("编辑正文必须是字符串")
     if "body_b64" in edits:
         if not isinstance(edits["body_b64"], str):
             raise ValueError("正文 Base64 必须是字符串")
         try:
-            body = base64.b64decode(edits["body_b64"], validate=True)
+            base64.b64decode(edits["body_b64"], validate=True)
         except (ValueError, TypeError) as exc:
             raise ValueError("正文 Base64 无效") from exc
-        if len(body) > MAX_BODY:
-            raise ValueError("编辑正文不能超过 1 MiB")
     if "headers" in edits:
         headers = edits["headers"]
         if not isinstance(headers, list) or len(headers) > 200:
@@ -60,9 +57,9 @@ def validate_http_edits(edits: dict) -> dict:
     return edits
 
 
-def request_parts(record: dict, edits: dict):
+def request_parts(record: dict, edits: dict, body_store=None):
     validate_http_edits(edits)
-    if record.get("request_truncated") and not ({"body_text", "body_b64"} & edits.keys()):
+    if (record.get("request_truncated") or record.get("request_body_complete") is False) and not ({"body_text", "body_b64"} & edits.keys()):
         raise ValueError("请求正文已截断，请补齐完整正文后重发")
     method = edits.get("method", record.get("method", "GET"))
     url = edits.get("url", record.get("url", ""))
@@ -88,43 +85,102 @@ def request_parts(record: dict, edits: dict):
         if not content_type_found:
             headers.append(("Content-Type", "text/plain; charset=utf-8"))
     else:
-        if "request_body_b64" in record:
+        if record.get("request_body_ref"):
+            if body_store is None:
+                raise ValueError("完整请求正文保存在文件中，需要正文存储才能重发")
+            try:
+                body = body_store.read_body(record, "request")
+            except (OSError, ValueError) as exc:
+                raise ValueError("无法读取已保存的完整请求正文") from exc
+        elif "request_body_b64" in record and record["request_body_b64"] is not None:
             try:
                 body = base64.b64decode(record["request_body_b64"], validate=True)
             except (ValueError, TypeError) as exc:
                 raise ValueError("已保存的请求正文 Base64 无效") from exc
         else:
+            if record.get("request_preview_truncated"):
+                raise ValueError("请求正文仅有预览，请补齐完整正文后重发")
             body = record.get("request_body_text", "").encode("utf-8")
     return method, url, headers, body
 
 
-def replay_http(record: dict, edits: dict) -> dict:
-    method, url, headers, body = request_parts(record, edits)
+def _decoded_body(raw: bytes, headers: list) -> tuple[str, str | None]:
+    """Decode content encoding and declared charset without changing raw bytes."""
+    try:
+        response = httpx.Response(200, headers=[(k.encode("ascii"), v.encode("utf-8")) for k, v in headers], content=raw)
+        content = response.content
+        content_encoding = response.headers.get("content-encoding", "").strip().lower()
+        decode_error = None
+        if content_encoding not in {"", "identity"} and raw and content == raw:
+            decode_error = "Unsupported or undecoded Content-Encoding: " + content_encoding
+        charset = response.charset_encoding or "utf-8"
+        return content.decode(charset, errors="replace"), decode_error
+    except (httpx.HTTPError, LookupError, ValueError) as exc:
+        return raw.decode("utf-8", errors="replace"), str(exc)
+
+
+def _snapshot(prefix: str, raw: bytes, headers: list, body_store=None) -> dict:
+    text, decode_error = _decoded_body(raw, headers)
+    if body_store is not None:
+        result = body_store.snapshot(prefix, raw, text)
+    else:
+        result = {
+            f"{prefix}_body_text": text, f"{prefix}_body_b64": base64.b64encode(raw).decode(),
+            f"{prefix}_body_size": len(raw), f"{prefix}_text_size": len(text.encode("utf-8")),
+            f"{prefix}_body_complete": True, f"{prefix}_truncated": False,
+            f"{prefix}_preview_truncated": False,
+        }
+    result[f"{prefix}_body_binary"] = decode_error is not None or "\x00" in text or "\ufffd" in text
+    result[f"{prefix}_body_decode_error"] = decode_error
+    return result
+
+
+def replay_http(record: dict, edits: dict, body_store=None) -> dict:
+    method, url, headers, body = request_parts(record, edits, body_store)
     parsed = urlsplit(url)
     result = {"source": "http", "protocol": parsed.scheme.upper(), "method": method, "url": url,
               "dst_ip": parsed.hostname, "dst_port": parsed.port or (443 if parsed.scheme == "https" else 80),
               "summary": f"{method} {url}", "state": "replayed", "replay_of": record["id"],
               "attribution": "host-replay", "container_id": "", "container_name": "宿主机重发",
-              "request_headers": headers, "request_body_text": body.decode("utf-8", errors="replace"),
-              "request_body_b64": base64.b64encode(body).decode(), "payload_text": body.decode("utf-8", errors="replace")}
+              "request_headers": headers, "http_version": "HTTP/1.1"}
     started = time.monotonic()
+    chunks = []
+    response_headers = []
     try:
+        result.update(_snapshot("request", body, headers, body_store))
+        result["payload_text"] = result["request_body_text"]
         with httpx.Client(timeout=20, trust_env=False, follow_redirects=False) as client:
             with client.stream(method, url,
                                headers=[(k.encode("ascii"), v.encode("utf-8")) for k, v in headers],
                                content=body) as response:
-                chunks, length = [], 0
-                for chunk in response.iter_bytes():
-                    chunks.append(chunk[:max(0, MAX_BODY + 1 - length)])
-                    length += len(chunk)
-                    if length > MAX_BODY:
-                        break
-                content = b"".join(chunks)[:MAX_BODY]
-                result.update(status_code=response.status_code, response_headers=list(response.headers.multi_items()),
-                              response_body_text=content.decode("utf-8", errors="replace"), response_body_b64=base64.b64encode(content).decode(),
-                              response_truncated=length > MAX_BODY)
+                # Include HTTPX's generated Host/Content-Length and default headers
+                # so the replay record describes the request actually sent.
+                result["request_headers"] = list(response.request.headers.multi_items())
+                response_headers = list(response.headers.multi_items())
+                result.update(status_code=response.status_code, response_headers=response_headers,
+                              response_http_version=response.http_version)
+                # Preserve the complete body as sent on the wire, including its
+                # Content-Encoding. Exhausting iter_raw also detects incomplete
+                # Content-Length/chunked responses instead of marking a prefix complete.
+                for chunk in response.iter_raw():
+                    chunks.append(chunk)
+                result.update(_snapshot("response", b"".join(chunks), response_headers, body_store))
+                result["payload_text"] += "\n" + result["response_body_text"]
     except (httpx.HTTPError, OSError, ValueError) as exc:
         result.update(state="error", error=str(exc))
+        if "request_body_complete" not in result:
+            result.update(request_body_complete=False, request_truncated=True,
+                          request_body_error="Could not save replay request body: " + str(exc))
+        else:
+            # Retain received bytes for diagnosis, while refusing to call partial
+            # network reads or failed persistence a complete response.
+            try:
+                result.update(_snapshot("response", b"".join(chunks), response_headers, body_store))
+            except (OSError, ValueError):
+                result.update(response_body_ref=None, response_text_ref=None,
+                              response_body_size=sum(map(len, chunks)))
+            result.update(response_body_complete=False, response_truncated=True,
+                          response_body_error="Response capture did not complete: " + str(exc))
     result["duration_ms"] = round((time.monotonic() - started) * 1000, 2)
     return result
 

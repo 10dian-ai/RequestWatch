@@ -1,12 +1,16 @@
 """Exercise deployment scripts with command stubs; never run apt or systemd."""
 from __future__ import annotations
 
+import importlib.util
 import io
+import json
 import os
 from pathlib import Path
 import shlex
 import shutil
 import subprocess
+import sys
+from types import SimpleNamespace
 import tarfile
 
 import pytest
@@ -53,6 +57,7 @@ def shell(tmp_path):
         "PATH": str(bin_dir) + os.pathsep + env.get("PATH", ""),
         "TEST_COMMAND_LOG": posix(tmp_path / "commands.log"),
         "TEST_INSTALL_MARKER": posix(tmp_path / "installed"),
+        "TEST_REAL_PYTHON": posix(Path(sys.executable)),
         "MSYS_NO_PATHCONV": "1",
         "MSYS2_ARG_CONV_EXCL": "*",
     })
@@ -69,6 +74,16 @@ if [ "$1" = -m ] && [ "$2" = venv ]; then
   cp "$TEST_VENV_PYTHON" "$3/bin/python"
   chmod +x "$3/bin/python"
   exit 0
+fi
+if [[ "$1" = */deployment_settings.py ]]; then
+  arguments=()
+  for argument in "$@"; do
+    if [[ "$argument" = /* ]] && command -v cygpath >/dev/null 2>&1; then
+      argument="$(cygpath -w "$argument")"
+    fi
+    arguments+=("$argument")
+  done
+  exec "$TEST_REAL_PYTHON" "${arguments[@]}"
 fi
 exit 90
 ''')
@@ -211,8 +226,9 @@ def stage_installer(shell):
     text = text.replace("/run/systemd/system", posix(runtime / "systemd" / "system"))
     write(script, text)
     write(source / "pyproject.toml", "[project]\nname='requestwatch'\n")
+    write(source / "scripts" / "deployment_settings.py", (ROOT / "scripts" / "deployment_settings.py").read_text(encoding="utf-8"))
     write(source / "deploy" / "requestwatch.service", "[Service]\n")
-    write(source / "deploy" / "requestwatch.env.example", f"RW_HOST=0.0.0.0\nRW_PORT=7030\nRW_DATA_DIR={posix(data)}\n")
+    write(source / "deploy" / "requestwatch.env.example", f"RW_HOST=0.0.0.0\nRW_PORT=7030\nRW_DATA_DIR={data.resolve().as_posix()}\n")
     return script, target, etc, data
 
 
@@ -282,3 +298,115 @@ def test_install_rejects_symlink_target_before_apt(shell):
 def test_deployment_scripts_have_valid_bash_syntax(name):
     result = subprocess.run([BASH, "-n", posix(ROOT / "scripts" / name)], capture_output=True)
     assert result.returncode == 0, result.stderr.decode(errors="replace")
+
+
+@pytest.mark.parametrize("host,health_host,display_host", [
+    ("127.0.0.1", "127.0.0.1", "127.0.0.1"),
+    ("0.0.0.0", "127.0.0.1", "203.0.113.7"),
+    ("::", "[::1]", "203.0.113.7"),
+    ("2001:db8::2", "[2001:db8::2]", "[2001:db8::2]"),
+])
+def test_installer_uses_saved_web_address_and_rotated_token_file(shell, host, health_host, display_host):
+    script, _, etc, data = stage_installer(shell)
+    env_file = etc / "requestwatch" / "requestwatch.env"
+    write(env_file, f"RW_HOST=localhost\nRW_PORT=7040\nRW_DATA_DIR={data.resolve().as_posix()}\nRW_TOKEN=old-environment-secret\n")
+    saved = json.dumps({"host": host, "port": 7050, "token": "new-web-rotated-secret", "queue_num": 7051})
+    write(data / "settings.json", saved)
+    write(data / "admin-token", "new-web-rotated-secret\n")
+    result = run(script, shell)
+    assert result.returncode == 0, result.stderr
+    assert f"http://{health_host}:7050/" in log(shell)
+    assert f"Web UI：http://{display_host}:7050" in result.stdout
+    assert ":7040/" not in log(shell)
+    assert "admin-token" in result.stdout and "设置" in result.stdout
+    assert "sudoedit" not in result.stdout and "grep" not in result.stdout
+    assert "old-environment-secret" not in result.stdout + result.stderr + log(shell)
+    assert "new-web-rotated-secret" not in result.stdout + result.stderr + log(shell)
+    assert (data / "settings.json").read_text() == saved
+    assert (data / "admin-token").read_text() == "new-web-rotated-secret\n"
+
+
+def test_installer_rejects_saved_shell_text_as_address_without_execution(shell):
+    script, _, _, data = stage_installer(shell)
+    marker = shell[0] / "injected"
+    write(data / "settings.json", json.dumps({"host": f"$(touch {posix(marker)})", "port": 7050}))
+    result = run(script, shell)
+    assert result.returncode != 0
+    assert not marker.exists()
+    assert "Web UI：" not in result.stdout
+    assert "curl " not in log(shell)
+
+
+def load_script(name):
+    spec = importlib.util.spec_from_file_location("test_" + name, ROOT / "scripts" / (name + ".py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_cleanup_uses_initial_saved_and_applied_queue_numbers(tmp_path, monkeypatch):
+    cleanup = load_script("cleanup_firewall")
+    (tmp_path / "settings.json").write_text(json.dumps({"queue_num": 7050}))
+    (tmp_path / "runtime.json").write_text(json.dumps({"active_queue_num": 7040}))
+    queues = []
+    monkeypatch.setattr(cleanup, "cleanup", queues.append)
+    cleanup.cleanup_configured({"RW_QUEUE_NUM": "7030", "RW_DATA_DIR": str(tmp_path)})
+    assert queues == [7030, 7050, 7040]
+    (tmp_path / "runtime.json").write_text(json.dumps({"active_queue_num": 7050}))
+    queues.clear()
+    cleanup.cleanup_configured({"RW_QUEUE_NUM": "7030", "RW_DATA_DIR": str(tmp_path)})
+    assert queues == [7030, 7050]
+
+
+@pytest.mark.parametrize("bad_value", [0, 65536, -1, True, 7030.5, "7030; echo injected", []])
+def test_cleanup_invalid_saved_queue_does_not_prevent_active_cleanup(tmp_path, monkeypatch, bad_value):
+    cleanup = load_script("cleanup_firewall")
+    (tmp_path / "settings.json").write_text(json.dumps({"queue_num": bad_value}))
+    (tmp_path / "runtime.json").write_text(json.dumps({"active_queue_num": 7040}))
+    queues = []
+    monkeypatch.setattr(cleanup, "cleanup", queues.append)
+    with pytest.raises(RuntimeError, match="settings.json"):
+        cleanup.cleanup_configured({"RW_QUEUE_NUM": "7030", "RW_DATA_DIR": str(tmp_path)})
+    assert queues == [7030, 7040]
+
+
+def test_cleanup_continues_after_one_chain_failure(tmp_path, monkeypatch):
+    cleanup = load_script("cleanup_firewall")
+    (tmp_path / "settings.json").write_text(json.dumps({"queue_num": 7050}))
+    (tmp_path / "runtime.json").write_text(json.dumps({"active_queue_num": 7040}))
+    queues = []
+
+    def fail_one(queue):
+        queues.append(queue)
+        if queue == 7030:
+            raise RuntimeError("foreign rule")
+
+    monkeypatch.setattr(cleanup, "cleanup", fail_one)
+    with pytest.raises(RuntimeError, match="foreign rule"):
+        cleanup.cleanup_configured({"RW_QUEUE_NUM": "7030", "RW_DATA_DIR": str(tmp_path)})
+    assert queues == [7030, 7050, 7040]
+
+
+def test_cleanup_never_flushes_unowned_rules_or_other_chain(tmp_path, monkeypatch):
+    cleanup = load_script("cleanup_firewall")
+    (tmp_path / "settings.json").write_text(json.dumps({"queue_num": 7050}))
+    commands = []
+    monkeypatch.setattr(cleanup.shutil, "which", lambda name: name if name == "iptables" else None)
+
+    def command(args, **kwargs):
+        assert kwargs.get("shell", False) is False
+        commands.append(args)
+        if "-C" in args:
+            return SimpleNamespace(returncode=1, stdout="", stderr="")
+        if "-S" in args:
+            chain = args[-1]
+            comment = "foreign-rule" if chain == "RWATCH_7030" else "requestwatch-managed-7050"
+            return SimpleNamespace(returncode=0, stdout=f"-N {chain}\n-A {chain} -m comment --comment {comment} -j RETURN\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(cleanup.subprocess, "run", command)
+    with pytest.raises(RuntimeError, match="non-RequestWatch"):
+        cleanup.cleanup_configured({"RW_QUEUE_NUM": "7030", "RW_DATA_DIR": str(tmp_path)})
+    flushes = [args for args in commands if "-F" in args or "-X" in args]
+    assert [args[-2:] for args in flushes] == [["-F", "RWATCH_7050"], ["-X", "RWATCH_7050"]]
+    assert all(args[-1] in ("RWATCH_7030", "RWATCH_7050") for args in commands)

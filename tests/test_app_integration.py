@@ -38,6 +38,9 @@ def test_app_rule_pause_edit_search_and_replay(tmp_path):
     mitmdump = os.getenv("RW_MITMDUMP", "")
     assert mitmdump and Path(mitmdump).is_absolute() and Path(mitmdump).is_file(), "Set RW_MITMDUMP to an absolute executable path"
     seen = []
+    original_body = "x" * (2 * 1024 * 1024) + "hold-me"
+    approved_body = "y" * (3 * 1024 * 1024) + "approved-body-tail"
+    replayed_body = "z" * (2 * 1024 * 1024) + "replayed-body-tail"
 
     class Origin(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -82,7 +85,7 @@ def test_app_rule_pause_edit_search_and_replay(tmp_path):
 
     def send_request():
         with httpx.Client(proxy=f"http://127.0.0.1:{proxy_port}", trust_env=False, timeout=20) as client:
-            return client.post(origin_url + "/original", content="hold-me", headers={"Content-Type": "text/plain"})
+            return client.post(origin_url + "/original", content=original_body, headers={"Content-Type": "text/plain"})
 
     try:
         until(lambda: server.started, "actual app startup", seconds=20)
@@ -117,14 +120,16 @@ def test_app_rule_pause_edit_search_and_replay(tmp_path):
             assert not future.done()
             assert seen == [], "The pending request must not have reached the origin"
             detail = admin.get(f"/api/records/{record_id}").json()
-            assert detail["request_body_text"] == "hold-me"
+            assert detail["request_body_complete"] and detail["request_preview_truncated"]
+            assert admin.get(f"/api/records/{record_id}/body/request?view=text").text == original_body
+            assert admin.get("/api/records", params={"q": "hold-me"}).json()["total"] == 1
             decision = admin.post(f"/api/records/{record_id}/decision", json={"action": "accept", "edits": {
-                "method": "PUT", "url": origin_url + "/edited", "body_text": "approved-body",
+                "method": "PUT", "url": origin_url + "/edited", "body_text": approved_body,
                 "headers": [["Content-Type", "text/plain; charset=utf-8"], ["X-Repeat", "one"], ["X-Repeat", "two"]]}})
             assert decision.status_code == 200, decision.text
             response = future.result(timeout=10)
             assert response.status_code == 201
-            assert seen == [{"method": "PUT", "path": "/edited", "body": "approved-body", "repeat": ["one", "two"]}]
+            assert seen == [{"method": "PUT", "path": "/edited", "body": approved_body, "repeat": ["one", "two"]}]
 
             def response_is_searchable():
                 result = admin.get("/api/records", params={"q": "origin-response-only-marker", "source": "http"}).json()
@@ -134,16 +139,23 @@ def test_app_rule_pause_edit_search_and_replay(tmp_path):
             updated = admin.get(f"/api/records/{record_id}").json()
             assert updated["state"] == "forwarded"
             assert updated["status_code"] == 201
-            assert updated["request_body_text"] == "approved-body"
-            replay = admin.post(f"/api/records/{record_id}/replay", json={"edits": {"body_text": "replayed-body"}})
+            assert updated["request_body_complete"] and updated["request_preview_truncated"]
+            assert admin.get(f"/api/records/{record_id}/body/request?view=raw").content == approved_body.encode()
+            assert admin.get(f"/api/records/{record_id}/body/response?view=raw").content == response.content
+            assert admin.get(f"/api/records/{record_id}/message/request").content.endswith(approved_body.encode())
+            assert admin.get("/api/records", params={"q": "approved-body-tail"}).json()["total"] == 1
+            unchanged = admin.post(f"/api/records/{record_id}/replay", json={"edits": {}})
+            assert unchanged.status_code == 200, unchanged.text
+            assert seen[-1]["body"] == approved_body
+            replay = admin.post(f"/api/records/{record_id}/replay", json={"edits": {"body_text": replayed_body}})
             assert replay.status_code == 200, replay.text
             repeated = replay.json()
             assert repeated["id"] != record_id
             assert repeated["replay_of"] == record_id
             assert repeated["state"] == "replayed"
             assert repeated["status_code"] == 201
-            assert len(seen) == 2 and seen[1] == {"method": "PUT", "path": "/edited", "body": "replayed-body", "repeat": ["one", "two"]}
-            assert admin.get("/api/records", params={"q": "origin-response-only-marker"}).json()["total"] == 2
+            assert len(seen) == 3 and seen[2] == {"method": "PUT", "path": "/edited", "body": replayed_body, "repeat": ["one", "two"]}
+            assert admin.get("/api/records", params={"q": "origin-response-only-marker"}).json()["total"] == 3
     finally:
         server.should_exit = True
         server_thread.join(timeout=15)

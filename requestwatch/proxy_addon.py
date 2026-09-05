@@ -10,6 +10,8 @@ import base64
 import binascii
 import copy
 import logging
+import importlib.util
+from pathlib import Path
 import os
 import re
 import time
@@ -23,7 +25,18 @@ try:
 except ImportError:  # Pure edit and timeout helpers are testable without mitmproxy.
     http = None
 
-MAX_BODY_BYTES = 1024 * 1024
+# mitmdump executes this file as an independent module in its own venv.
+# Load the adjacent stdlib-only body store without importing the web application.
+if __package__ == "requestwatch":
+    from .body_store import BodyStore
+else:
+    _body_spec = importlib.util.spec_from_file_location(
+        "requestwatch_body_store", Path(__file__).with_name("body_store.py"))
+    _body_module = importlib.util.module_from_spec(_body_spec)
+    _body_spec.loader.exec_module(_body_module)
+    BodyStore = _body_module.BodyStore
+
+PREVIEW_BYTES = 64 * 1024
 API_OUTAGE_SECONDS = 3.0
 POLL_SECONDS = 0.20
 TOKEN_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
@@ -39,24 +52,54 @@ def header_pairs(headers: Any) -> list[list[str]]:
     return [[safe_text(k), safe_text(v)] for k, v in headers.items(multi=True)]
 
 
-def body_snapshot(message: Any, prefix: str) -> dict[str, Any]:
-    raw = message.raw_content or b""
-    limited = raw[:MAX_BODY_BYTES]
+def body_snapshot(message: Any, prefix: str, body_store: Any = None) -> dict[str, Any]:
+    """Save complete raw and decoded bodies; only metadata carries a preview."""
+    raw = message.raw_content
+    if raw is None:
+        return failed_body_snapshot(message, prefix, "Body unavailable (streamed or incomplete capture)")
+    decode_error = None
     try:
-        text = message.get_text(strict=False) or ""
-    except (ValueError, LookupError):
-        text = limited.decode("utf-8", "replace")
-    # The byte snapshot is the on-wire body (possibly compressed). The text is
-    # decoded for search/editing; text edits use mitmproxy's charset/encoding API.
-    binary = "\x00" in text or "\ufffd" in text or any(0xDC80 <= ord(c) <= 0xDCFF for c in text)
-    text_bytes = safe_text(text).encode("utf-8")
-    preview = text_bytes[:MAX_BODY_BYTES].decode("utf-8", "ignore")
+        text = message.get_text(strict=True) or ""
+    except (ValueError, LookupError) as exc:
+        decode_error = safe_text(str(exc))
+        try:
+            text = message.get_text(strict=False) or ""
+        except (ValueError, LookupError):
+            text = raw.decode("utf-8", "replace")
+    binary = decode_error is not None or "\x00" in text or "\ufffd" in text or any(0xDC80 <= ord(c) <= 0xDCFF for c in text)
+    text = safe_text(text)
+    if body_store is not None:
+        result = body_store.snapshot(prefix, raw, text)
+    else:
+        # Compatibility for old inline records and pure helper callers. Production
+        # always supplies RW_DATA_DIR, so complete bodies are stored as files.
+        result = {
+            f"{prefix}_body_b64": base64.b64encode(raw).decode("ascii"),
+            f"{prefix}_body_text": text,
+            f"{prefix}_body_size": len(raw),
+            f"{prefix}_text_size": len(text.encode("utf-8")),
+            f"{prefix}_body_complete": True,
+            f"{prefix}_truncated": False,
+            f"{prefix}_preview_truncated": False,
+        }
+    result[f"{prefix}_body_binary"] = binary
+    result[f"{prefix}_body_error"] = None
+    result[f"{prefix}_body_decode_error"] = decode_error
+    return result
+
+
+def failed_body_snapshot(message: Any, prefix: str, error: str) -> dict[str, Any]:
+    """Never pass a failed disk write or absent body off as complete capture."""
+    raw = message.raw_content or b""
+    preview = raw[:PREVIEW_BYTES].decode("utf-8", "replace")
     return {
-        f"{prefix}_body_b64": base64.b64encode(limited).decode("ascii"),
-        f"{prefix}_body_text": preview,
-        f"{prefix}_body_size": len(raw),
-        f"{prefix}_truncated": len(raw) > MAX_BODY_BYTES or len(text_bytes) > MAX_BODY_BYTES,
-        f"{prefix}_body_binary": binary,
+        f"{prefix}_body_ref": None, f"{prefix}_text_ref": None,
+        f"{prefix}_body_b64": base64.b64encode(raw[:PREVIEW_BYTES]).decode("ascii"),
+        f"{prefix}_body_text": preview, f"{prefix}_body_size": len(raw),
+        f"{prefix}_text_size": None, f"{prefix}_body_complete": False,
+        f"{prefix}_truncated": True, f"{prefix}_preview_truncated": len(raw) > PREVIEW_BYTES,
+        f"{prefix}_body_binary": "\x00" in preview or "\ufffd" in preview,
+        f"{prefix}_body_error": safe_text(error),
     }
 
 
@@ -138,12 +181,28 @@ def edited_request(request: Any, edits: dict[str, Any]) -> Any:
 
 class RequestWatchAddon:
     def __init__(self, api_url: str | None = None, token: str | None = None,
-                 client: Any = None):
+                 client: Any = None, body_store: Any = None):
         self.api_url = (api_url or os.getenv("RW_API_URL", "http://127.0.0.1:7030")).rstrip("/")
         self.token = token if token is not None else os.getenv("RW_TOKEN", "")
         self.client = client
+        self.body_store = body_store
+        self.data_dir = os.getenv("RW_DATA_DIR")
         self._tasks: set[asyncio.Task] = set()
         self._updates: dict[str, asyncio.Task] = {}
+
+    async def _snapshot(self, message: Any, prefix: str) -> dict[str, Any]:
+        def save():
+            if self.body_store is None and self.data_dir:
+                self.body_store = BodyStore(self.data_dir)
+            return body_snapshot(message, prefix, self.body_store)
+
+        try:
+            # Disk I/O and full-body decoding must neither block concurrent flows
+            # nor inherit the management API's three-second outage timeout.
+            return await asyncio.to_thread(save)
+        except (OSError, ValueError, UnicodeError) as exc:
+            log.warning("Could not save complete %s body: %s; forwarding remains available", prefix, exc)
+            return failed_body_snapshot(message, prefix, f"Could not save complete body: {exc}")
 
     async def _api(self, method: str, path: str, data: dict | None = None,
                    timeout: float = API_OUTAGE_SECONDS) -> dict:
@@ -242,12 +301,14 @@ class RequestWatchAddon:
         request = flow.request
         src = flow.client_conn.peername or ("", 0)
         dst = flow.server_conn.peername or (request.host, request.port)
-        snapshot = body_snapshot(request, "request")
+        snapshot = await self._snapshot(request, "request")
         record = {
             "id": flow.id, "source": "http", "protocol": request.scheme.upper(),
             "created_at": time.time(), "src_ip": src[0], "src_port": src[1],
             "dst_ip": dst[0], "dst_port": dst[1], "method": request.method,
             "url": safe_text(request.url), "request_headers": header_pairs(request.headers),
+            "http_version": safe_text(getattr(request, "http_version", "HTTP/1.1")),
+            "request_trailers": header_pairs(request.trailers) if getattr(request, "trailers", None) is not None else [],
             "summary": safe_text(f"{request.method} {request.url}"), "state": "captured",
             "payload_text": self._search_text(request, snapshot), **snapshot,
         }
@@ -281,10 +342,12 @@ class RequestWatchAddon:
         if decision.get("edits"):
             try:
                 flow.request = edited_request(flow.request, decision["edits"])
-                snapshot = body_snapshot(flow.request, "request")
+                snapshot = await self._snapshot(flow.request, "request")
                 changes.update({"method": flow.request.method, "url": flow.request.url,
                                 "summary": f"{flow.request.method} {flow.request.url}",
-                                "request_headers": header_pairs(flow.request.headers), **snapshot})
+                                "request_headers": header_pairs(flow.request.headers),
+                                "request_trailers": header_pairs(flow.request.trailers) if getattr(flow.request, "trailers", None) is not None else [],
+                                **snapshot})
                 flow.metadata["rw_payload"] = self._search_text(flow.request, snapshot)
                 changes["payload_text"] = flow.metadata["rw_payload"]
             except (ValueError, TypeError, UnicodeError) as exc:
@@ -296,12 +359,14 @@ class RequestWatchAddon:
             return
         if flow.response is None:
             return
-        snapshot = body_snapshot(flow.response, "response")
+        snapshot = await self._snapshot(flow.response, "response")
         headers = header_pairs(flow.response.headers)
         search = "\n".join(f"{k}: {v}" for k, v in headers)
         self._update_later(flow.metadata["rw_id"], {
             "state": "forwarded", "status_code": flow.response.status_code,
             "response_headers": headers,
+            "response_http_version": safe_text(getattr(flow.response, "http_version", "HTTP/1.1")),
+            "response_trailers": header_pairs(flow.response.trailers) if getattr(flow.response, "trailers", None) is not None else [],
             "duration_ms": round((time.monotonic() - flow.metadata["rw_start"]) * 1000, 2),
             "payload_text": flow.metadata.get("rw_payload", "") + "\n" + search + "\n" + snapshot["response_body_text"],
             **snapshot,
@@ -311,6 +376,8 @@ class RequestWatchAddon:
         if "rw_id" in flow.metadata and not flow.metadata.get("rw_dropped"):
             self._update_later(flow.metadata["rw_id"], {
                 "state": "error", "error": safe_text(str(flow.error)),
+                "response_body_complete": False, "response_truncated": True,
+                "response_body_error": "Upstream response did not complete: " + safe_text(str(flow.error)),
                 "duration_ms": round((time.monotonic() - flow.metadata["rw_start"]) * 1000, 2),
             })
 

@@ -9,7 +9,9 @@ CONTAINERS = [
 
 
 def seed(runtime):
-    if runtime.store.stats()["total"]:
+    if runtime.streams and not runtime.streams.list_sessions(limit=1)["total"]:
+        seed_tcp(runtime)
+    if runtime.store.get("demo-http-0"):
         return
     for i, (method, path, status, body) in enumerate([
         ("GET", "/v1/orders?limit=20", 200, '{"orders": [{"id": "ORD-2048", "status": "已付款"}]}'),
@@ -57,13 +59,18 @@ def intercept_example(runtime):
     return runtime.ingest(record, can_intercept=True)
 
 
-def apply_demo_edits(record, edits):
+def apply_demo_edits(record, edits, body_store=None):
     from .replay import request_parts
     result = dict(record)
     if not edits:
         return result
     if record["source"] == "http":
-        method, url, headers, body = request_parts(record, edits)
+        if body_store:
+            record = dict(record)
+            record["request_body_b64"] = base64.b64encode(body_store.read_body(record)).decode()
+        method, url, headers, body = request_parts(record, edits, body_store)
+        for suffix in ("_body_ref", "_text_ref", "_body_complete", "_truncated", "_body_size"):
+            result.pop("request" + suffix, None)
         result.update(method=method, url=url, request_headers=headers,
                       request_body_text=body.decode("utf-8", errors="replace"),
                       request_body_b64=base64.b64encode(body).decode(),
@@ -72,3 +79,34 @@ def apply_demo_edits(record, edits):
         payload = bytes.fromhex(edits.get("payload_hex", record.get("payload_hex", "")))
         result.update(payload_hex=payload.hex(), payload_text=payload.decode("utf-8", errors="replace"), payload_size=len(payload))
     return result
+
+
+def seed_tcp(runtime):
+    """Synthetic packets only; never opens a socket or sends traffic."""
+    import socket
+    import struct
+    from .network import _checksum
+    client, server = "172.18.0.4", "192.0.2.30"
+    request = b"EVENT /jobs\r\nContent-Type: application/json\r\n\r\n" + ('{"event":"跨包完整会话","padding":"' + 'x' * 80000 + '","result":"TCP-DEMO-END"}').encode()
+    response = b"OK 200\r\n\r\n" + '服务端完整响应'.encode()
+    def add(reverse, seq, flags, payload=b""):
+        src, dst = (server, client) if reverse else (client, server)
+        sport, dport = (9000, 45000) if reverse else (45000, 9000)
+        transport = struct.pack("!HHIIBBHHH", sport, dport, seq, 0, 5 << 4, flags, 65535, 0, 0) + payload
+        pseudo = socket.inet_aton(src) + socket.inet_aton(dst) + struct.pack("!BBH", 0, 6, len(transport))
+        transport = transport[:16] + struct.pack("!H", _checksum(pseudo + transport)) + transport[18:]
+        header = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(transport), 0, 0, 64, 6, 0, socket.inet_aton(src), socket.inet_aton(dst))
+        header = header[:10] + struct.pack("!H", _checksum(header)) + header[12:]
+        runtime.ingest({"source": "packet", "protocol": "TCP", "state": "captured", "demo": True,
+                       "src_ip": src, "src_port": sport, "dst_ip": dst, "dst_port": dport,
+                       "container_id": "demo-worker", "container_name": "event-worker", "attribution": "demo",
+                       "summary": "TCP 演示会话 · " + ("响应" if reverse else "请求"),
+                       "raw_b64": base64.b64encode(header + transport).decode(),
+                       "payload_text": payload.decode("utf-8", errors="replace"), "payload_hex": payload.hex(), "payload_size": len(payload)})
+    add(False, 100, 2)
+    add(True, 500, 18)
+    for offset in reversed(range(0, len(request), 32000)):
+        add(False, 101 + offset, 24, request[offset:offset + 32000])
+    add(True, 501, 24, response)
+    add(False, 101 + len(request), 17)
+    add(True, 501 + len(response), 17)
