@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>RequestWatch · 网络请求工作台</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='8' fill='%232f3437'/%3E%3Cpath d='M8 21h6l4-9 5 16 4-7h5' fill='none' stroke='%23fff' stroke-width='3'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <a class="brand" href="#traffic" aria-label="RequestWatch 首页">
+        <svg class="brand-mark" width="32" height="32" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="currentColor"/><path d="M6 17h5l3-8 4 14 3-6h5" stroke="#fff" stroke-width="2.4" fill="none" stroke-linejoin="round"/></svg>
+        <span>RequestWatch<small>网络请求工作台</small></span>
+      </a>
+      <button class="text-button mobile-guide" data-view="guide">接入指南 ↗</button>
+      <div class="nav-label">工作空间</div>
+      <nav class="navigation" aria-label="主导航">
+        <button class="nav-item active" data-view="traffic"><span class="nav-symbol" aria-hidden="true">≋</span>网络流量<span class="nav-count" id="nav-total">—</span></button>
+        <button class="nav-item" data-view="pending"><span class="nav-symbol" aria-hidden="true">Ⅱ</span>拦截队列<span class="nav-count pending-count" id="nav-pending">0</span></button>
+        <button class="nav-item" data-view="rules"><span class="nav-symbol" aria-hidden="true">⊞</span>拦截规则</button>
+        <button class="nav-item" data-view="containers"><span class="nav-symbol" aria-hidden="true">▣</span>Docker 容器</button>
+      </nav>
+      <div class="sidebar-bottom">
+        <button class="nav-item" data-view="guide"><span class="nav-symbol" aria-hidden="true">↗</span>接入指南</button>
+        <div class="server-card"><span class="tiny-label">SERVER CONSOLE</span><strong>Ubuntu <span class="muted">/</span> <span id="server-port">:7030</span></strong><span class="server-caption">本机与容器网络观测</span></div>
+      </div>
+    </aside>
+
+    <div class="workspace">
+      <header class="topbar">
+        <div class="breadcrumb">工作空间 <span>/</span> <strong id="breadcrumb-title">网络流量</strong></div>
+        <div class="top-actions"><span id="connection" class="connection"><i></i>连接中</span><span class="demo-badge" id="demo-badge" hidden>演示模式</span><button class="icon-button" id="auth-button" title="设置访问令牌" aria-label="设置访问令牌"><svg viewBox="0 0 20 20" width="18" height="18" fill="none" aria-hidden="true"><path d="M6 9V6a4 4 0 0 1 8 0v3M5 9h10v8H5z" stroke="currentColor" stroke-width="1.7"/><path d="M10 12v2" stroke="currentColor" stroke-width="1.7"/></svg></button></div>
+      </header>
+      <main>
+        <div id="global-error" class="notice danger" role="alert" hidden></div>
+        <div id="demo-notice" class="notice warning" hidden>当前为演示模式。下方记录为示例数据，操作不会发送真实网络请求。切换到 Ubuntu 实时部署后即可采集。</div>
+        <section id="view-traffic" class="view">
+          <div class="page-heading"><div><div class="eyebrow">NETWORK OBSERVABILITY</div><h1 id="traffic-title">网络流量<span class="heading-dot">.</span></h1><p id="traffic-subtitle">查看每一次连接，按规则暂停，在放行前检查与修改。</p></div><div class="heading-actions"><button id="refresh-button" class="button secondary">刷新</button><button id="poll-button" class="button primary" aria-pressed="true"><span class="live-dot"></span><span>实时刷新</span></button></div></div>
+          <div class="stats-grid">
+            <div class="stat"><span>已捕获记录</span><strong id="stat-total">—</strong><small>HTTP 请求与网络包</small></div>
+            <div class="stat"><span><i class="stat-dot amber"></i>等待处理</span><strong id="stat-pending">—</strong><small>命中规则的暂停请求</small></div>
+            <div class="stat"><span>HTTP / HTTPS</span><strong id="stat-http">—</strong><small>应用层请求与响应</small></div>
+            <div class="stat"><span>TCP / UDP</span><strong id="stat-packets">—</strong><small>网络层数据包</small></div>
+          </div>
+          <div class="engine-strip"><span><i id="capture-dot" class="engine-dot"></i>抓包引擎 <strong id="capture-state">检测中</strong></span><span><i id="proxy-dot" class="engine-dot"></i>HTTP 代理 <strong id="proxy-state">检测中</strong></span><span><i id="docker-dot" class="engine-dot"></i>Docker <strong id="docker-state">检测中</strong></span><button class="text-button" data-view="guide">查看接入方式 ↗</button></div>
+          <section class="traffic-panel" aria-label="流量列表和详情">
+            <form id="filter-form" class="filter-bar" role="search">
+              <label class="search-field"><svg width="18" height="18" viewBox="0 0 20 20" fill="none" aria-hidden="true"><circle cx="8.5" cy="8.5" r="5.5" stroke="currentColor" stroke-width="1.7"/><path d="m13 13 4 4" stroke="currentColor" stroke-width="1.7"/></svg><input id="filter-query" type="search" autocomplete="off" placeholder="搜索正文、URL、请求头或 IP…" aria-label="搜索流量文字"><kbd>/</kbd></label>
+              <select id="filter-protocol" aria-label="协议筛选"><option value="">全部协议</option><option>HTTP</option><option>HTTPS</option><option>TCP</option><option>UDP</option></select>
+              <select id="filter-container" aria-label="容器筛选"><option value="">全部容器 / 本机</option></select>
+              <select id="filter-state" aria-label="状态筛选"><option value="">全部状态</option><option value="pending">等待处理</option><option value="captured">已捕获</option><option value="forwarded">已放行</option><option value="dropped">已丢弃</option><option value="replayed">已重发</option><option value="error">错误</option></select>
+              <button type="button" id="reset-filters" class="text-button">重置</button>
+            </form>
+            <div class="traffic-workbench" id="traffic-workbench">
+              <div class="record-list">
+                <div class="list-caption"><strong id="list-heading">所有流量</strong><span id="record-count">正在加载…</span><span class="last-updated" id="last-updated"></span></div>
+                <div class="table-scroll"><table class="records-table"><thead><tr><th class="time-col">时间 / 协议</th><th>请求 / 目标地址</th><th class="container-col">来源</th><th class="state-col">状态</th></tr></thead><tbody id="records-body"></tbody></table><div class="empty-state" id="records-empty"><div class="empty-glyph" aria-hidden="true">≋</div><h3>正在连接工作台</h3><p>获取抓包引擎与代理状态…</p></div></div>
+                <div class="pagination"><span id="page-info">每页 50 条</span><div><button id="previous-page" class="button compact secondary" disabled>上一页</button><button id="next-page" class="button compact secondary" disabled>下一页</button></div></div>
+              </div>
+              <aside class="detail-panel" aria-label="记录详情">
+                <div class="detail-empty" id="detail-empty"><span class="detail-cross" aria-hidden="true">+</span><h3>从一条请求开始</h3><p>选择左侧记录，查看请求内容、响应和原始字节，并进行放行、丢弃或重发。</p><span class="keyboard-hint">使用顶部搜索快速定位内容</span></div>
+                <div id="detail-content" hidden>
+                  <div class="detail-heading"><div><span class="tiny-label">REQUEST INSPECTOR</span><h2 id="detail-title">请求详情</h2></div><button id="close-detail" class="icon-button" aria-label="关闭详情">×</button></div>
+                  <div class="detail-meta-line"><span id="detail-protocol" class="badge"></span><span id="detail-state" class="badge"></span><span id="detail-id" class="muted mono"></span></div>
+                  <p class="detail-url mono" id="detail-url"></p>
+                  <div id="detail-alert" class="notice compact" hidden></div>
+                  <div class="detail-tabs" role="tablist" aria-label="详情内容"><button role="tab" class="active" data-tab="overview" aria-selected="true">概要</button><button role="tab" data-tab="request" aria-selected="false">请求</button><button role="tab" data-tab="response" aria-selected="false">响应</button><button role="tab" data-tab="hex" aria-selected="false">HEX</button></div>
+                  <div id="detail-body" class="detail-body" role="tabpanel"></div>
+                  <div class="edit-bar"><button id="edit-button" class="button secondary compact">编辑内容</button><button id="export-button" class="text-button">导出 JSON ↗</button></div>
+                  <form id="edit-form" class="edit-form" hidden>
+                    <div class="editor-heading"><strong>编辑草稿</strong><span id="draft-status">修改仅在放行 / 重发时提交</span></div>
+                    <div id="http-editor"><div class="form-row method-url"><label>方法<input id="edit-method" class="mono" maxlength="24"></label><label>URL<input id="edit-url" class="mono" type="url"></label></div><label>请求头 <span class="muted">JSON 键值对数组，保留重复字段</span><textarea id="edit-headers" class="code-input" rows="5" spellcheck="false" aria-label="编辑请求头"></textarea></label><label>正文<textarea id="edit-body" class="code-input" rows="7" spellcheck="false" aria-label="编辑请求正文"></textarea></label><p class="field-help" id="body-edit-help">未修改的正文将保持原始字节。</p></div>
+                    <div id="packet-editor" hidden><label>Payload · 十六进制<textarea id="edit-hex" class="code-input" rows="8" spellcheck="false" aria-label="编辑数据包十六进制载荷"></textarea></label><p class="field-help" id="packet-edit-help">每个字节以两位十六进制表示；空格与换行会被忽略。</p></div>
+                    <button id="discard-draft" class="text-button" type="button">还原草稿</button>
+                  </form>
+                  <div class="detail-actions"><div id="pending-actions" hidden><button id="accept-button" class="button primary">放行请求</button><button id="drop-button" class="button danger-button">丢弃</button></div><button id="replay-button" class="button secondary">重发请求 ↗</button></div>
+                  <p class="action-help" id="action-help"></p>
+                </div>
+              </aside>
+            </div>
+          </section>
+          <div class="workspace-footnote"><span>按规则拦截 · 超时策略由服务端控制</span><span>页面自动刷新不会覆盖编辑草稿</span></div>
+        </section>
+
+        <section id="view-rules" class="view" hidden><div class="page-heading"><div><div class="eyebrow">TRAFFIC CONTROL</div><h1>拦截规则<span class="heading-dot">.</span></h1><p>仅暂停命中规则的流量。规则内条件同时满足，启用规则之间任意命中即可。</p></div><button id="new-rule" class="button primary">+ 新建规则</button></div><div class="notice">先接入抓包或 HTTP 代理，再启用拦截规则。等待超时后将按服务端策略处理；TCP 载荷只能等长修改。</div><div id="demo-rule-tools" class="demo-rule-tools" hidden><span>演示验证：按第一条启用规则生成模拟请求，体验暂停、编辑与放行。</span><button id="generate-demo-request" class="button secondary">生成匹配演示请求 →</button></div><div class="rules-list" id="rules-list"></div></section>
+        <section id="view-containers" class="view" hidden><div class="page-heading"><div><div class="eyebrow">DOCKER INVENTORY</div><h1>Docker 容器<span class="heading-dot">.</span></h1><p>按容器来源定位网络请求，查看容器网络模式及可识别地址。</p></div><button id="refresh-containers" class="button secondary">刷新容器</button></div><div id="container-status" class="notice"></div><div id="containers-list" class="containers-list"></div><p class="field-help">Host 网络共享宿主机 IP，无法仅凭 IP 精确归属容器。经 NAT、代理转发或网络命名空间变化的流量，来源识别也可能受限。</p></section>
+        <section id="view-guide" class="view" hidden><div class="page-heading"><div><div class="eyebrow">GET CONNECTED</div><h1>接入指南<span class="heading-dot">.</span></h1><p>Web 操作台位于 7030 端口。根据协议选择对应的流量接入方式。</p></div></div><div class="guide-grid">
+          <article class="guide-section"><span class="step-number">01 / HTTP & HTTPS</span><h2>配置代理，查看解密后的请求</h2><p>将目标程序或 Docker 容器的 HTTP_PROXY / HTTPS_PROXY 指向 RequestWatch 服务器的代理端口（默认 8080）。</p><pre class="code-block">HTTP_PROXY=http://&lt;服务器IP&gt;:8080
+HTTPS_PROXY=http://&lt;服务器IP&gt;:8080</pre><p>在目标程序的信任库中安装 RequestWatch CA 后，才能查看及修改 HTTPS 明文。容器内的 localhost 指向容器自身，请使用可达的宿主机地址。</p><p>代理默认监听 127.0.0.1。容器或远程程序接入前，在服务端配置 RW_PROXY_HOST 为可达地址；配置 RW_PROXY_AUTH 后，目标程序还需提供代理用户名与密码。</p><button id="download-ca" class="button secondary">下载代理 CA 证书 ↓</button><p class="field-help">代理启动后可下载证书。证书固定、独立信任库、忽略代理设置的程序需要另行适配。证书不会自动安装到目标设备。</p></article>
+          <article class="guide-section"><span class="step-number">02 / TCP & UDP</span><h2>启用 Ubuntu 抓包与暂停</h2><p>在 Ubuntu 上以 root 运行捕获引擎，使用 NFQUEUE 接收本机与 Docker 转发的网络包。安装和启动命令见项目 README。</p><ul class="guide-list"><li>捕获的数据包可以按文本、协议、端口和容器搜索。</li><li>创建规则后，命中的数据包会进入「拦截队列」。</li><li>放行前可编辑载荷，TCP 必须保持字节长度不变。</li><li>非 HTTP 的 TLS 和其他加密流量只能查看密文字节；原始包不等同于完整应用请求。</li></ul><div class="guide-note">重发 TCP 载荷会建立新连接；重发 UDP 会发送新数据报。它们不会恢复原连接状态，协议握手和认证仍可能影响结果。</div></article>
+          <article class="guide-section"><span class="step-number">03 / INTERCEPT</span><h2>只暂停你关心的流量</h2><p>按容器、目标主机或 IP、端口和关键词组合建立规则。先使用窄范围规则验证，再扩大匹配范围。</p><button class="text-button" data-view="rules">管理拦截规则 →</button><p class="field-help">SSH、工作台和代理端口的保护范围由后端控制。默认保护端口：<span id="protected-ports">22、7030、8080</span>。</p></article>
+          <article class="guide-section"><span class="step-number">04 / ACCESS</span><h2>连接与访问令牌</h2><p>访问令牌通过 Authorization: Bearer 请求头发送，仅保存在当前浏览器会话中。服务端令牌变更后，在这里更新即可。</p><button id="guide-auth-button" class="button secondary">设置访问令牌</button><div class="guide-note" id="runtime-summary">正在获取运行状态…</div></article>
+        </div></section>
+      </main>
+      <footer class="license-footer"><span>© 2026 RequestWatch contributors</span><span><a href="https://github.com/10dian-ai/RequestWatch/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">AGPL-3.0-only</a> · <a href="https://github.com/10dian-ai/RequestWatch" target="_blank" rel="noopener noreferrer">获取源码 ↗</a> · 不提供担保，可按许可证分发</span></footer>
+    </div>
+  </div>
+
+  <dialog id="auth-dialog" class="modal auth-modal"><form id="auth-form"><div class="modal-heading"><div><span class="tiny-label">CONSOLE ACCESS</span><h2>连接 RequestWatch</h2></div><button type="button" class="icon-button" id="close-auth" aria-label="关闭登录">×</button></div><p>输入服务端配置的访问令牌，连接网络请求工作台。</p><label>访问令牌<input id="auth-token" type="password" autocomplete="off" placeholder="输入 RW_TOKEN 或 admin-token 文件中的令牌" required></label><div id="auth-error" class="notice danger" hidden role="alert"></div><p class="field-help">令牌仅保存在当前浏览器会话中。</p><div class="modal-footer"><button type="button" id="clear-token" class="text-button">清除令牌</button><button type="submit" id="login-button" class="button primary">连接工作台 →</button></div></form></dialog>
+  <dialog id="rule-dialog" class="modal"><form id="rule-form"><div class="modal-heading"><div><span class="tiny-label">INTERCEPTION RULE</span><h2 id="rule-dialog-title">新建拦截规则</h2></div><button type="button" class="icon-button" id="close-rule" aria-label="关闭规则编辑">×</button></div><input id="rule-id" type="hidden"><label>规则名称<input id="rule-name" required maxlength="100" placeholder="例如：暂停 api 容器的支付请求"></label><div class="form-row"><label>接入类型<select id="rule-source"><option value="any">全部接入类型</option><option value="http">HTTP 代理</option><option value="packet">原始网络包</option></select></label><label>协议<select id="rule-protocol"><option value="any">全部协议</option><option>HTTP</option><option>HTTPS</option><option>TCP</option><option>UDP</option></select></label></div><label>来源容器<select id="rule-container"><option value="">全部容器 / 本机</option></select></label><div class="form-row"><label>目标主机 / IP<input id="rule-host" placeholder="不限制"></label><label>目标端口<input id="rule-port" type="number" min="1" max="65535" placeholder="不限制"></label></div><label>包含关键词<input id="rule-keyword" placeholder="正文或请求内容包含的文字"></label><div class="form-row"><label>等待处理超时（秒）<input id="rule-timeout" type="number" min="5" max="120" value="30" required></label><label class="checkbox-label"><input id="rule-enabled" type="checkbox" checked>启用此规则</label></div><p class="field-help">至少指定容器、目标地址、端口或关键词之一。等待超时为 5–120 秒。所有条件同时生效，网络包关键词不跨包重组。</p><div id="rule-error" class="notice danger" hidden role="alert"></div><div class="modal-footer"><button type="button" id="cancel-rule" class="button secondary">取消</button><button type="submit" id="save-rule" class="button primary">保存规则</button></div></form></dialog>
+  <dialog id="confirm-dialog" class="modal confirm-modal"><div class="modal-heading"><h2 id="confirm-title">确认操作</h2></div><p id="confirm-text"></p><div class="modal-footer"><button id="confirm-cancel" class="button secondary">取消</button><button id="confirm-ok" class="button primary">确认</button></div></dialog>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>

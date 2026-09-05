@@ -1,0 +1,26 @@
+[Unit]
+Description=RequestWatch network inspection and Web UI (7030)
+After=network-online.target docker.service systemd-tmpfiles-setup.service
+Wants=network-online.target
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/requestwatch
+EnvironmentFile=/etc/requestwatch/requestwatch.env
+ExecStart=/opt/requestwatch/.venv/bin/python -m requestwatch
+ExecStopPost=/usr/bin/python3 /opt/requestwatch/scripts/cleanup_firewall.py
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=45
+KillMode=mixed
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# iptables must share the host's xtables lock; installer creates it via tmpfiles.
+ReadWritePaths=/var/lib/requestwatch /run/xtables.lock
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_DAC_OVERRIDE
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK AF_PACKET
+[Install]
+WantedBy=multi-user.target

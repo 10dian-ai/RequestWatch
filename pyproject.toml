@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "requestwatch"
+version = "0.1.0"
+description = "Ubuntu and Docker network inspection console"
+readme = "README.md"
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "uvicorn>=0.34,<1",
+  "scapy>=2.6,<3",
+  "httpx>=0.28,<1",
+]
+
+[project.urls]
+Homepage = "https://github.com/10dian-ai/RequestWatch"
+Repository = "https://github.com/10dian-ai/RequestWatch"
+Issues = "https://github.com/10dian-ai/RequestWatch/issues"
+
+[project.optional-dependencies]
+linux = ["NetfilterQueue==1.1.0"]
+proxy = ["mitmproxy==12.2.3"]
+test = ["pytest>=8,<10"]
+
+[project.scripts]
+requestwatch = "requestwatch.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["requestwatch*"]
+
+[tool.setuptools.package-data]
+requestwatch = ["static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

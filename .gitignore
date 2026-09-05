@@ -1,0 +1,15 @@
+.venv/
+.proxy-venv/
+__pycache__/
+*.py[cod]
+.pytest*/
+.env
+.env.*
+!.env.example
+data/
+artifacts/
+*.egg-info/
+node_modules/
+
+build/
+dist/
