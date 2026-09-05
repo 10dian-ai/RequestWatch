@@ -5,8 +5,16 @@ const { chromium } = require(process.env.RW_PLAYWRIGHT_MODULE || 'playwright-cor
 (async () => {
   const browser = await chromium.launch({ headless: true, ...(process.env.RW_BROWSER_PATH ? { executablePath: process.env.RW_BROWSER_PATH } : {}) });
   try {
-    const page = await browser.newPage({ viewport: { width: 1440, height: 1050 } });
+    const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
     const errors = []; page.on('pageerror', error => errors.push(String(error)));
+    const reportLayout = async label => {
+      const layout = await page.evaluate(() => ({ viewport: [innerWidth, innerHeight], overflow: document.documentElement.scrollWidth > innerWidth + 1, panes: [...document.querySelectorAll('.body-pane')].map(pane => {
+        const pre = pane.querySelector('.body-pane-content pre'); const toolbar = pane.querySelector('.body-pane-toolbar');
+        return { side: pane.dataset.bodySide, bodyTop: pre ? Math.round(pre.getBoundingClientRect().top) : null, firstLineY: pre ? Math.round(pre.getBoundingClientRect().top + parseFloat(getComputedStyle(pre).paddingTop)) : null, toolbarHeight: toolbar ? Math.round(toolbar.getBoundingClientRect().height) : 0 };
+      }) }));
+      console.log(`${label}: ${JSON.stringify(layout)}`);
+      fs.writeFileSync(path.join(__dirname, '..', 'artifacts', `layout-${label}.json`), JSON.stringify(layout, null, 2));
+    };
     await page.addInitScript(() => sessionStorage.setItem('requestwatch-token', 'body-test-token'));
     const now = Date.now() / 1000;
     const requestText = JSON.stringify({ prompt: '请求体\n' + '完整请求内容 '.repeat(8000) + 'REQUEST-END-VISIBLE' });
@@ -74,11 +82,24 @@ const { chromium } = require(process.env.RW_PLAYWRIGHT_MODULE || 'playwright-cor
     const pane = page.locator('[data-body-side="response"]');
     await pane.getByRole('searchbox', { name: '搜索此处全文' }).fill('RESPONSE-END-VISIBLE'); await pane.getByRole('button', { name: '查找', exact: true }).click();
     assert.equal(await page.evaluate(() => window.getSelection().toString()), 'RESPONSE-END-VISIBLE');
+    assert.equal(await pane.locator('.body-format-toolbar').count(), 0, 'paired view has one combined toolbar');
+    assert.equal(await pane.locator('.body-download-menu').getAttribute('open'), null);
+    await pane.locator('.body-download-menu > summary').focus();
+    await page.keyboard.press('Enter');
+    assert.equal(await pane.getByRole('button', { name: '下载原始正文', exact: true }).isVisible(), true);
+    await page.keyboard.press('Escape');
+    assert.equal(await pane.locator('.body-download-menu').getAttribute('open'), null, 'Escape closes the menu');
+    assert.equal(await page.locator('#record-detail-drawer').isVisible(), true, 'closing a download menu keeps the body open');
+    await pane.locator('.body-download-menu > summary').click();
+    assert.equal(await pane.getByRole('button', { name: '下载响应含头', exact: true }).isVisible(), true);
+    assert.equal(await pane.locator('#http-response-download-readable').isVisible(), true);
     const [responseDownload] = await Promise.all([page.waitForEvent('download'), pane.getByRole('button', { name: '下载原始正文', exact: true }).click()]);
     assert.equal(fs.readFileSync(await responseDownload.path(), 'utf8'), responseText);
     await page.locator('#toast').evaluate(node => { node.hidden = true; });
     fs.mkdirSync(path.join(__dirname, '..', 'artifacts'), { recursive: true });
     await page.locator('#record-detail-drawer').evaluate(node => { node.scrollTop = 0; });
+    await page.locator('.body-pane-content pre').evaluateAll(nodes => nodes.forEach(node => { node.scrollTop = 0; }));
+    await reportLayout('mock-http-desktop');
     await page.screenshot({ path: path.join(__dirname, '..', 'artifacts', 'webui-body-http-desktop.png'), fullPage: false, animations: 'disabled' });
     await page.locator('#close-detail').click();
     await page.locator('#records-body tr[data-id="packet-body"] .event-detail-button').click();
@@ -93,6 +114,8 @@ const { chromium } = require(process.env.RW_PLAYWRIGHT_MODULE || 'playwright-cor
     await page.locator('#inline-tcp-client-format').selectOption('text');
     await page.waitForFunction(text => document.querySelector('[data-body-side="client"] .inline-tcp-body')?.textContent === text, tcpText('client'));
     assert.equal(await page.locator('#inline-tcp-server-format').inputValue(), 'auto');
+    await page.locator('[data-body-side="server"] .body-download-menu > summary').click();
+    assert.equal(await page.locator('[data-body-side="server"]').getByRole('button', { name: '下载解析全文', exact: true }).isVisible(), true);
     const [tcpDownload] = await Promise.all([page.waitForEvent('download'), page.locator('[data-body-side="server"]').getByRole('button', { name: '下载全部原始字节', exact: true }).click()]);
     assert.equal(fs.readFileSync(await tcpDownload.path(), 'utf8'), tcpText('server'));
     inferred = true; revision++;
@@ -102,9 +125,13 @@ const { chromium } = require(process.env.RW_PLAYWRIGHT_MODULE || 'playwright-cor
     assert.equal(await page.locator('.body-workspace .body-pane-title').filter({ hasText: '请求体' }).count(), 0);
     await page.locator('#toast').evaluate(node => { node.hidden = true; });
     await page.locator('#record-detail-drawer').evaluate(node => { node.scrollTop = 0; });
+    await page.locator('.body-pane-content pre').evaluateAll(nodes => nodes.forEach(node => { node.scrollTop = 0; }));
+    await reportLayout('mock-tcp-desktop');
     await page.screenshot({ path: path.join(__dirname, '..', 'artifacts', 'webui-body-tcp-desktop.png'), fullPage: false, animations: 'disabled' });
     await page.setViewportSize({ width: 390, height: 844 });
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth + 1), false, 'mobile horizontal overflow');
+    await page.locator('.body-pane-content pre').evaluateAll(nodes => nodes.forEach(node => { node.scrollTop = 0; }));
+    await reportLayout('mock-tcp-mobile');
     await page.screenshot({ path: path.join(__dirname, '..', 'artifacts', 'webui-body-tcp-mobile.png'), fullPage: false, animations: 'disabled' });
     await page.locator('#close-detail').click();
     await page.locator('#records-body tr[data-id="http-get"] .event-detail-button').click();

@@ -2,4 +2,4 @@
 # Copyright (C) 2026 RequestWatch contributors
 """RequestWatch: inspect traffic on an Ubuntu host and its containers."""
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"

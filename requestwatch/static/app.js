@@ -203,12 +203,22 @@
   }
   const readableNames = { openai: '聊天增量合并', sse: 'SSE 事件正文', json: 'JSON 格式化', http: 'HTTP 消息', 'http-sse': 'HTTP / SSE 正文', text: '文本', chunked: 'HTTP 分块正文', binary: '二进制内容', unknown: '原始内容' };
   function readableLabel(meta) { return meta.label || readableNames[meta.kind] || meta.kind || '应用正文'; }
-  function appendReadable(target, entry, heading, className = '') {
+  function appendReadable(target, entry, heading, className = '', compact = false, collapseWarnings = false) {
     const meta = entry.meta || {};
     const note = meta.recognized ? `自动解析 · ${readableLabel(meta)} · ${meta.complete === false ? '当前已捕获部分，完整性受限' : '已载入全部解析内容'}` : '未识别可解析的应用协议，显示 UTF-8 原文；二进制或密文请切换 HEX。';
-    target.append(element('p', note, 'detail-note readable-status'));
-    if (meta.warnings?.length) target.append(element('p', meta.warnings.join(' '), 'detail-note readable-warning'));
-    addCode(target, heading, entry.content, `full-body readable-body ${className}`);
+    const partial = meta.recognized && meta.complete === false;
+    if ((!compact || !meta.recognized || partial) && !(collapseWarnings && partial)) target.append(element('p', note, 'detail-note readable-status'));
+    if (collapseWarnings && (partial || meta.warnings?.length)) {
+      const details = element('details', null, 'body-integrity-note');
+      details.append(element('summary', '内容可能不完整（展开原因）'));
+      if (partial) details.append(element('p', note, 'detail-note readable-status'));
+      if (meta.warnings?.length) details.append(element('p', meta.warnings.join(' '), 'detail-note readable-warning'));
+      target.append(details);
+    } else if (meta.warnings?.length) target.append(element('p', meta.warnings.join(' '), 'detail-note readable-warning'));
+    if (compact) {
+      if (entry.content) target.append(element('pre', entry.content, `code-block full-body readable-body ${className}`));
+      else target.append(element('p', '无内容', 'detail-note'));
+    } else addCode(target, heading, entry.content, `full-body readable-body ${className}`);
   }
   function updateContainerSelect(id, emptyLabel) {
     const node = $(id);
@@ -437,16 +447,20 @@
       .finally(() => { if (s.selectedId === record.id && readableBodyEntry(s.selected, side) === entry) renderDetailBody(); });
     return entry;
   }
-  function renderHttpBody(target, record, side, paired = false) {
+  function renderHttpBody(target, record, side, paired = false, paneTools = null) {
     const format = s.bodyFormat[side];
     const entry = format === 'auto' ? loadReadableBody(record, side) : loadBody(record, side);
     const caption = side === 'request' ? '请求正文' : '响应正文';
-    const controls = element('div', null, 'body-format-toolbar');
-    const label = element('label', '内容格式 '); const select = element('select'); select.id = paired ? `http-${side}-format` : 'http-body-format'; select.setAttribute('aria-label', `${caption}内容格式`);
+    const select = element('select'); select.id = paired ? `http-${side}-format` : 'http-body-format'; select.setAttribute('aria-label', `${caption}内容格式`);
     select.append(new Option('自动解析', 'auto'), new Option('UTF-8 原文', 'text')); select.value = format;
-    select.addEventListener('change', () => { s.bodyFormat[side] = select.value; renderDetailBody(); }); label.append(select); controls.append(label);
-    if (format === 'auto' && entry?.state === 'ready' && entry.meta?.download_url) { const button = element('button', '下载解析全文 ↗', 'text-button'); button.id = paired ? `http-${side}-download-readable` : 'http-download-readable'; button.addEventListener('click', () => download(entry.meta.download_url, `requestwatch-${record.id}-${side}-readable.txt`)); controls.append(button); }
-    target.append(controls);
+    select.addEventListener('change', () => { s.bodyFormat[side] = select.value; renderDetailBody(); });
+    const controls = element('div', null, 'body-format-toolbar');
+    if (paneTools) paneTools.toolbar.prepend(select);
+    else { const label = element('label', '内容格式 '); label.append(select); controls.append(label); target.append(controls); }
+    if (format === 'auto' && entry?.state === 'ready' && entry.meta?.download_url) {
+      const button = element('button', '下载解析全文 ↗', 'text-button'); button.id = paired ? `http-${side}-download-readable` : 'http-download-readable';
+      button.addEventListener('click', () => download(entry.meta.download_url, `requestwatch-${record.id}-${side}-readable.txt`)); (paneTools?.downloads || controls).append(button);
+    }
     const status = element('div', null, 'body-status');
     if (!entry || entry.state === 'loading') {
       status.append(element('span', `正在读取${format === 'auto' ? '并解析' : ''}完整${caption}…`, 'detail-note')); target.append(status); return;
@@ -458,10 +472,14 @@
       status.append(retry); target.append(status); return;
     }
     const complete = bodyComplete(record, side);
-    status.append(element('span', `${complete ? '原始正文完整保存' : bodyStatusText(record, side)} · ${bytes(record[`${side}_body_size`] ?? new TextEncoder().encode(entry.text || entry.content || '').length)}`, `detail-note${complete || bodyStreaming(record, side) ? '' : ' body-error'}`)); target.append(status);
+    const parsed = paired && format === 'auto' && entry.meta?.recognized && entry.meta?.complete !== false ? ` · ${readableLabel(entry.meta)}` : '';
+    status.append(element('span', `${complete ? '原始正文完整保存' : bodyStatusText(record, side)} · ${bytes(record[`${side}_body_size`] ?? new TextEncoder().encode(entry.text || entry.content || '').length)}${parsed}`, `detail-note${complete || bodyStreaming(record, side) ? '' : ' body-error'}`));
+    if (!paired || !complete) target.append(status);
     if (bodyStreaming(record, side) && !record[`${side}_body_size`]) target.append(element('p', '已收到响应头，正在等待第一段响应正文。', 'detail-note'));
-    if (format === 'auto') appendReadable(target, entry, caption);
+    if (format === 'auto') appendReadable(target, entry, caption, '', paired);
+    else if (paired) { if (entry.text) target.append(element('pre', entry.text, 'code-block full-body')); else target.append(element('p', '无内容', 'detail-note')); }
     else addCode(target, caption, entry.text, 'full-body');
+    if (paired && complete) { status.classList.add('body-footer'); target.append(status); }
     if (record[`${side}_body_binary`] || (side === 'request' && record.body_binary)) target.append(element('p', '二进制正文的文本视图可能包含替代字符。HEX 和「下载原始正文」保留全部原始字节；未编辑正文时也保持原始字节。', 'detail-note'));
   }
   function hexForBytes(data) { return Array.from(data, (byte) => byte.toString(16).padStart(2, '0')).join(''); }
@@ -750,9 +768,17 @@
     heading.append(element('h3', title, 'body-pane-title'));
     if (subtitle) heading.append(element('p', subtitle, 'body-pane-subtitle'));
     pane.append(heading);
-    const toolbar = element('div', null, 'body-pane-toolbar'); pane.append(toolbar);
+    const toolbar = element('div', null, 'body-pane-toolbar body-pane-tools'); pane.append(toolbar);
     const content = element('div', null, 'body-pane-content'); pane.append(content); workspace.append(pane);
     return { pane, toolbar, content };
+  }
+  function makePaneDownloadMenu(toolbar) {
+    const menu = element('details', null, 'body-download-menu');
+    const summary = element('summary', '下载'); summary.setAttribute('aria-label', '下载正文'); menu.append(summary);
+    const options = element('div', null, 'body-download-options'); menu.append(options); toolbar.append(menu);
+    options.addEventListener('click', event => { if (event.target.closest('button')) { menu.open = false; summary.focus(); } });
+    menu.addEventListener('keydown', event => { if (event.key === 'Escape' && menu.open) { event.preventDefault(); event.stopPropagation(); menu.open = false; summary.focus(); } });
+    return options;
   }
   function addPaneDownload(target, caption, path, filename) {
     const button = element('button', caption, 'text-button'); button.addEventListener('click', () => download(path, filename)); target.append(button);
@@ -777,7 +803,7 @@
       const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(range);
       const rect = range.getBoundingClientRect(); const box = match.block.getBoundingClientRect(); match.block.scrollTop += rect.top - box.top - 30;
     };
-    button.addEventListener('click', find); search.addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); find(); } }); toolbar.append(search, button);
+    button.addEventListener('click', find); search.addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); find(); } }); const group = element('div', null, 'body-pane-search'); group.append(search, button); toolbar.insertBefore(group, toolbar.querySelector('.body-download-menu'));
   }
   function renderPrimaryBodies(target, record) {
     const workspace = element('div', null, 'body-workspace'); target.append(workspace);
@@ -790,10 +816,11 @@
           continue;
         }
         const base = `/api/records/${encodeURIComponent(record.id)}`;
-        addPaneDownload(toolbar, '下载原始正文', `${base}/body/${side}?view=raw&download=true`, `requestwatch-${record.id}-${side}.bin`);
-        addPaneDownload(toolbar, side === 'request' ? '下载请求含头' : '下载响应含头', `${base}/message/${side}`, `requestwatch-${record.id}-${side}.http`);
+        const downloads = makePaneDownloadMenu(toolbar);
+        addPaneDownload(downloads, '下载原始正文', `${base}/body/${side}?view=raw&download=true`, `requestwatch-${record.id}-${side}.bin`);
+        addPaneDownload(downloads, side === 'request' ? '下载请求含头' : '下载响应含头', `${base}/message/${side}`, `requestwatch-${record.id}-${side}.http`);
+        renderHttpBody(content, record, side, true, { toolbar, downloads });
         addPaneSearch(pane, toolbar, `${record.id}:${side}`);
-        renderHttpBody(content, record, side, true);
         if (!record[`${side}_body_size`] && !bodyStreaming(record, side)) content.append(element('p', side === 'request' ? '无请求正文；请求行和请求头可在下方展开。' : '无响应正文。', 'body-empty-state'));
         const headers = element('details', null, 'body-pane-headers'); headers.append(element('summary', side === 'request' ? '请求行与请求头' : '响应头'));
         if (side === 'request') addCode(headers, '请求行', `${record.method || 'GET'} ${record.url || ''}`);
@@ -812,7 +839,7 @@
       const session = entry.session;
       for (const side of ['client', 'server']) renderInlineTcpPane(workspace, record, session, side);
       const notes = sessionWarnings(session); if (entry.error) notes.unshift(`更新失败：${entry.error}；保留上次成功读取的内容。`);
-      if (notes.length) { const details = element('details', null, 'body-capture-notes'); details.append(element('summary', '连接完整性说明'), element('p', notes.join(' '), 'detail-note')); target.append(details); }
+      if (notes.length) { const details = element('details', null, 'body-capture-notes'); details.open = true; details.append(element('summary', '连接完整性说明'), element('p', notes.join(' '), 'detail-note')); target.append(details); }
       return;
     }
     const { content } = makeBodyPane(workspace, 'packet', record.protocol === 'TCP' ? '单包载荷 · 关联连接不可用' : 'UDP 数据报内容');
@@ -857,19 +884,22 @@
     const select = element('select'); select.id = `inline-tcp-${side}-format`; select.setAttribute('aria-label', `${caption}内容格式`);
     select.append(new Option('自动解析', 'auto'), new Option('UTF-8 原文', 'text'), new Option('Latin-1 原文', 'latin1')); select.value = format;
     select.addEventListener('change', () => { recordSessionFormats[side] = select.value; renderDetailBody(); }); toolbar.append(select);
-    addPaneDownload(toolbar, '下载全部原始字节', `/api/sessions/${encodeURIComponent(session.id)}/body/${side}?view=raw&download=true`, `requestwatch-session-${session.id}-${side}.bin`);
-    if (entry.meta?.download_url) addPaneDownload(toolbar, '下载解析全文', entry.meta.download_url, `requestwatch-session-${session.id}-${side}.txt`);
+    const downloads = makePaneDownloadMenu(toolbar);
+    addPaneDownload(downloads, '下载全部原始字节', `/api/sessions/${encodeURIComponent(session.id)}/body/${side}?view=raw&download=true`, `requestwatch-session-${session.id}-${side}.bin`);
+    if (entry.meta?.download_url) addPaneDownload(downloads, '下载解析全文', entry.meta.download_url, `requestwatch-session-${session.id}-${side}.txt`);
     addPaneSearch(pane, toolbar, `${session.id}:${side}`);
     if (!direction.byte_count) content.append(element('p', session.state === 'open' ? '此方向尚未捕获到应用内容，收到后会继续显示。' : '此方向未保存应用内容。', 'body-empty-state'));
     const shown = entry.state === 'ready' ? entry : entry.previous;
-    if (shown) {
-      if (format === 'auto') appendReadable(content, shown, caption, 'inline-tcp-body');
-      else addCode(content, caption, shown.content, 'full-body inline-tcp-body');
-    }
     if (entry.state === 'loading') content.append(element('p', shown ? '正在更新此方向内容…' : '正在读取此方向全部已捕获内容…', 'detail-note'));
     if (entry.state === 'error') {
       content.append(element('p', `正文读取失败：${entry.error}`, 'detail-note body-error'));
       const retry = element('button', '重新读取正文', 'button secondary compact'); retry.addEventListener('click', () => { recordSessionBodies.delete(`${side}:${format}`); renderDetailBody(); }); content.append(retry);
+    }
+    if (shown) {
+      if (format === 'auto') appendReadable(content, shown, caption, 'inline-tcp-body', true);
+      else if (shown.content) content.append(element('pre', shown.content, 'code-block full-body inline-tcp-body'));
+      else content.append(element('p', '无内容', 'detail-note'));
+      if (format === 'auto' && shown.meta?.recognized && shown.meta?.complete !== false) content.append(element('p', `自动解析 · ${readableLabel(shown.meta)}`, 'detail-note body-footer'));
     }
   }
   function packetPayloadText(record) {
@@ -964,6 +994,8 @@
     $('session-endpoints').textContent = `${endpoint(session.client_ip, session.client_port)} ⇄ ${endpoint(session.server_ip, session.server_port)}`;
     const warnings = sessionWarnings(session);
     message('session-alert', warnings.length ? warnings.join(' ') : '已观察到完整连接，双向内容均已保存。', `compact ${warnings.length ? 'warning' : ''}`);
+    if ($('session-alert-details')) $('session-alert-details').hidden = warnings.length === 0;
+    if ($('session-alert-summary')) $('session-alert-summary').textContent = '内容可能不完整（展开原因）';
     const metadata = element('dl', null, 'metadata');
     addMetadata(metadata, '开始时间', time(session.created_at, true)); addMetadata(metadata, '最后更新', time(session.updated_at, true)); addMetadata(metadata, '捕获包数', session.packet_count); addMetadata(metadata, 'Docker 容器', session.container_name || '本机 / 未识别');
     $('session-metadata').replaceChildren(metadata);
@@ -1004,13 +1036,18 @@
         .finally(() => { if (s.sessionId === session.id && s.sessionSide === side && s.sessionFormat === format) renderSessionBody(); });
     }
     if (entry.state === 'ready') {
-      target.append(element('p', format === 'hex' ? '此页原始字节已载入；使用页码可访问所有已保存字节。' : '已载入此方向全部已保存内容；文本不设预览截断。', 'detail-note'));
-      if (format === 'auto') appendReadable(target, entry, sessionDirectionLabel(session, side), 'session-full-body');
-      else addCode(target, sessionDirectionLabel(session, side), format === 'hex' ? formatHex(entry.content, start) : entry.content, format === 'hex' ? 'hex' : 'full-body session-full-body');
+      if (format === 'auto') appendReadable(target, entry, sessionDirectionLabel(session, side), 'session-full-body', true, true);
+      else {
+        const content = format === 'hex' ? formatHex(entry.content, start) : entry.content;
+        if (content) target.append(element('pre', content, format === 'hex' ? 'code-block hex' : 'code-block full-body session-full-body'));
+        else target.append(element('p', '无内容', 'detail-note'));
+      }
+      const parsed = format === 'auto' && entry.meta?.recognized ? ` · ${readableLabel(entry.meta)}` : '';
+      target.append(element('p', format === 'hex' ? '此页原始字节已载入；使用页码可访问所有已保存字节。' : `已载入此方向全部已保存内容${parsed}`, 'detail-note body-footer'));
     } else if (entry.state === 'loading') target.append(element('p', format === 'hex' ? '正在读取此页原始字节…' : '正在读取此方向的完整已保存内容…', 'detail-note'));
     else { target.append(element('p', `内容加载失败：${entry.error}`, 'detail-note body-error')); const retry = element('button', '重新读取', 'button secondary compact'); retry.addEventListener('click', () => { sessionBodyCache.delete(key); renderSessionBody(); }); target.append(retry); }
     if (direction.gaps?.length) {
-      const details = element('details', null, 'session-gaps'); details.append(element('summary', `缺失片段位置 · ${direction.gap_count || direction.gaps.length} 处`));
+      const details = element('details', null, 'session-gaps'); details.append(element('summary', `内容可能不完整 · ${direction.gap_count || direction.gaps.length} 处缺失（展开位置）`));
       addCode(details, 'TCP 序列区间', direction.gaps.map((gap) => `${gap.start}–${gap.end}：缺失 ${gap.size} 字节`).join('\n')); target.append(details);
     }
     $('session-download-readable').hidden = format !== 'auto';

@@ -88,6 +88,13 @@ const { chromium } = require(process.env.RW_PLAYWRIGHT_MODULE || 'playwright-cor
     assert.equal(await page.locator('#session-content .readable-body').textContent(), readableStream);
     assert.match(await page.locator('[data-session-side="client"]').textContent(), /端点 A → B（方向推测）/);
     assert.match(await page.locator('#session-content').textContent(), /连接仍在采集/);
+    const integrity = page.locator('#session-content .body-integrity-note');
+    assert.equal(await integrity.locator('summary').isVisible(), true, 'partial content is clearly flagged before the body');
+    assert.equal(await integrity.getAttribute('open'), null);
+    await integrity.locator('summary').click();
+    assert.equal(await integrity.locator('.readable-warning').isVisible(), true, 'all capture warnings remain accessible');
+    await integrity.locator('summary').click();
+    assert.equal(await page.locator('#session-content > .detail-section-label').count(), 0, 'direction tab already labels this body');
     await page.locator('#session-content .readable-body').evaluate(node => { node.scrollTop = 1000; node.dataset.identityCheck = 'keep'; });
     const contentCalls = readableRequests.length;
     await page.locator('#refresh-sessions').click();
