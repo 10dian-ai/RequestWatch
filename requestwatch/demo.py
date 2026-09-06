@@ -1,14 +1,18 @@
 import base64
+import json
 import time
 
 
 CONTAINERS = [
+    {"id": "demo-newapi", "name": "new-api-demo", "image": "new-api:demo", "status": "演示容器", "network_mode": "bridge", "ips": ["172.18.0.2"], "ports": [{"private_port": 3000, "public_port": 3000, "ip": "0.0.0.0", "type": "tcp"}]},
     {"id": "demo-api", "name": "orders-api", "image": "orders-api:dev", "status": "演示容器", "network_mode": "bridge", "ips": ["172.18.0.3"]},
     {"id": "demo-worker", "name": "event-worker", "image": "event-worker:dev", "status": "演示容器", "network_mode": "bridge", "ips": ["172.18.0.4"]},
 ]
 
 
 def seed(runtime):
+    if getattr(runtime.config, "inspection_profile", "network") == "newapi":
+        seed_newapi(runtime)
     if runtime.streams and not runtime.streams.list_sessions(limit=1)["total"]:
         seed_tcp(runtime)
     if runtime.store.get("demo-http-0"):
@@ -110,3 +114,31 @@ def seed_tcp(runtime):
     add(True, 501, 24, response)
     add(False, 101 + len(request), 17)
     add(True, 501 + len(response), 17)
+
+
+def seed_newapi(runtime):
+    """Explicitly simulated two-leg LLM exchange; never contacts New API."""
+    if runtime.store.get("demo-newapi-client"):
+        return
+    messages = [
+        {"role": "system", "content": "用中文回答。保留重要细节，给出可执行的步骤。"},
+        {"role": "user", "content": "解释 Docker Compose 中服务名、宿主机映射端口和容器端口的区别。"},
+    ]
+    response = (
+        'data: '+json.dumps({"choices":[{"index":0,"delta":{"reasoning_content":"先区分宿主机和容器的网络空间。","content":"同一 Compose 网络里的服务可以通过服务名互相访问。\n"}}]},ensure_ascii=False)+'\n\n'
+        +'data: '+json.dumps({"choices":[{"index":0,"delta":{"content":"宿主机访问映射端口；容器之间使用服务名和容器内部端口。"},"finish_reason":"stop"}]},ensure_ascii=False)+'\n\ndata: [DONE]\n\n'
+    )
+    for leg in ("client", "upstream"):
+        body = {"model": "client-model-alias" if leg == "client" else "provider-model-demo", "messages": messages, "stream": True}
+        if leg == "upstream":
+            body = {**body, "messages": [{"role":"system","content":"这是渠道附加的系统提示，仅出现在上游请求。"}]+messages}
+        raw = json.dumps(body,ensure_ascii=False).encode()
+        url = "http://new-api-demo:3000/v1/chat/completions" if leg == "client" else "https://provider.example.test/v1/chat/completions"
+        runtime.ingest({"id":"demo-newapi-"+leg,"source":"http","protocol":"HTTP" if leg=="client" else "HTTPS",
+                       "capture_leg":leg,"state":"forwarded","created_at":time.time()-(1 if leg=="client" else 0),
+                       "method":"POST","url":url,"summary":"POST /v1/chat/completions","status_code":200,
+                       "container_id":"demo-newapi","container_name":"new-api-demo","attribution":"demo","demo":True,
+                       "request_headers":[["Content-Type","application/json"]],"request_body_b64":base64.b64encode(raw).decode(),
+                       "request_body_text":raw.decode(),"response_headers":[["Content-Type","text/event-stream"]],
+                       "response_body_b64":base64.b64encode(response.encode()).decode(),"response_body_text":response,
+                       "response_sse_utf8":True,"request_body_complete":True,"response_body_complete":True})

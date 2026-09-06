@@ -11,6 +11,7 @@ import time
 import uuid
 
 from .stream_decode import DECODER_VERSION, decode_stream_file
+from .prompt_view import PROMPT_VERSION, decode_prompt_file
 
 
 class ReadableCache:
@@ -40,9 +41,11 @@ class ReadableCache:
             path.touch()
             return meta, path
 
-    def build(self, owner, source, **options):
+    def build(self, owner, source, *, presentation="auto", side="response", **options):
         source = Path(source)
-        signature = json.dumps([owner, str(source.resolve()), source.stat().st_size, DECODER_VERSION, options], sort_keys=True)
+        if presentation not in {"auto", "prompt"}:
+            raise ValueError("无效的正文视图")
+        signature = json.dumps([owner, str(source.resolve()), source.stat().st_size, DECODER_VERSION, PROMPT_VERSION, presentation, side, options], sort_keys=True)
         revision = hashlib.sha256(signature.encode()).hexdigest()
         try:
             return self.get(owner, revision)[0]
@@ -51,7 +54,9 @@ class ReadableCache:
         temporary = self.root / (".decode-" + uuid.uuid4().hex)
         meta_tmp = temporary.with_suffix(".json")
         try:
-            result = decode_stream_file(source, temporary, **options)
+            result = (decode_prompt_file(source, temporary, side=side, **options) if presentation == "prompt"
+                      else decode_stream_file(source, temporary, **options))
+            result.setdefault("presentation", presentation)
             temporary.chmod(0o600)
             result.update(revision=revision, content_size=temporary.stat().st_size)
             meta_tmp.write_text(json.dumps({**result, "owner": owner}, ensure_ascii=False), encoding="utf-8")

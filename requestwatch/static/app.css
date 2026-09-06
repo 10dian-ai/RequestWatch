@@ -330,3 +330,29 @@ body.record-drawer-open { overflow:hidden; }
   #view-traffic .page-heading { margin-bottom:10px; }
   .session-alert-details { margin-left:12px; margin-right:12px; }
 }
+
+/* New API setup is a compact disclosure; captured content stays the primary surface. */
+.filter-bar { flex-wrap:wrap; }
+#filter-source,#filter-leg { max-width:190px; }
+.filter-bar .search-field { flex:1 1 340px; }
+.newapi-setup { font-size:13px; color:#3e5d7f; margin:0 0 12px; }
+.newapi-setup > summary { cursor:pointer; font-weight:600; padding:5px 0; }
+.newapi-setup-content { padding:12px 14px; margin-top:6px; border:1px solid var(--border); background:#fff; border-radius:6px; }
+.newapi-setup-content p { margin:0 0 10px; line-height:1.6; }
+.newapi-setup-grid { display:grid; grid-template-columns:1fr 1fr; gap:22px; margin:12px 0; }
+.newapi-setup-grid strong { display:block; margin-bottom:7px; color:#234366; }
+.newapi-setup-grid code { font-size:12px; overflow-wrap:anywhere; }
+.newapi-setup-actions { display:flex; gap:16px; align-items:center; }
+.settings-profile { max-width:1280px; padding:4px 0 12px; }
+.settings-profile label { display:flex; gap:12px; align-items:center; font-size:14px; }
+.settings-profile select { padding:7px 10px; border-radius:6px; font-size:14px; }
+.settings-profile .field-help { margin:8px 0 0; }
+.newapi-listeners { max-width:1280px; }
+@media(max-width:640px) { .newapi-setup-grid { grid-template-columns:1fr; gap:12px; } #filter-source,#filter-leg { max-width:none; flex:1 1 44%; } .settings-profile label { display:block; } .settings-profile select { width:100%; margin-top:6px; } }
+
+.newapi-container-picker { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin:10px 0 14px; }
+.newapi-container-picker label { margin:0; }
+.newapi-container-picker select { max-width:400px; padding:6px 8px; font-size:14px; border-radius:6px; }
+.newapi-guide { grid-column:1/-1; }
+.newapi-guide .metadata { max-width:720px; margin:12px 0; }
+.newapi-guide .code-block { max-width:940px; }

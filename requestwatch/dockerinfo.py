@@ -50,6 +50,10 @@ class DockerInventory:
                     "status": str(item.get("State") or item.get("Status") or "unknown"),
                     "network_mode": str((item.get("HostConfig") or {}).get("NetworkMode", "unknown")),
                     "ips": sorted(addresses),
+                    "ports": [{"private_port": entry.get("PrivatePort"), "public_port": entry.get("PublicPort"),
+                               "ip": entry.get("IP", ""), "type": entry.get("Type", "tcp")}
+                              for entry in item.get("Ports", []) if isinstance(entry, dict)
+                              and isinstance(entry.get("PrivatePort"), int)],
                 })
             with self._lock:
                 self._containers = sorted(containers, key=lambda row: row["name"])
@@ -65,7 +69,7 @@ class DockerInventory:
 
     def list(self) -> list[dict[str, Any]]:
         with self._lock:
-            return [{**item, "ips": list(item["ips"])} for item in self._containers]
+            return [{**item, "ips": list(item["ips"]), "ports": [dict(port) for port in item.get("ports", [])]} for item in self._containers]
 
     def identify(self, src_ip: str, dst_ip: str) -> dict[str, Any]:
         def normalize(value):

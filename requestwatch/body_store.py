@@ -112,18 +112,35 @@ class BodyStore:
                 else:
                     declared = re.search(r"charset\s*=\s*[\"']?([\w.:-]+)", content_type, re.I)
                     encoding = declared.group(1) if declared else "utf-8-sig"
-                text_path = work / "text.txt"
                 decoder = codecs.getincrementaldecoder(encoding)(errors="strict")
-                with current.open("rb") as incoming, text_path.open("wb") as output:
-                    while chunk := incoming.read(PREVIEW_BYTES):
-                        text = decoder.decode(chunk)
-                        result[prefix + "_body_binary"] |= "\x00" in text or "\ufffd" in text
-                        output.write(text.encode("utf-8"))
-                    final = decoder.decode(b"", final=complete)
-                    result[prefix + "_body_binary"] |= "\x00" in final or "\ufffd" in final
-                    output.write(final.encode("utf-8"))
-                text_ref = self.put_file(text_path)
-                text_size = text_path.stat().st_size
+                codec = codecs.lookup(encoding).name
+                identical_utf8 = codec in {"utf-8", "utf-8-sig"} and not (
+                    codec == "utf-8-sig" and sample.startswith(codecs.BOM_UTF8))
+                if identical_utf8:
+                    # New API JSON/SSE is normally already UTF-8. Validate it
+                    # without writing and hashing a duplicate decoded body. A
+                    # partial final character remains exclusively in raw bytes.
+                    with current.open("rb") as incoming:
+                        while chunk := incoming.read(PREVIEW_BYTES):
+                            text = decoder.decode(chunk)
+                            result[prefix + "_body_binary"] |= "\x00" in text or "\ufffd" in text
+                        final = decoder.decode(b"", final=complete)
+                        result[prefix + "_body_binary"] |= "\x00" in final or "\ufffd" in final
+                    text_size = current.stat().st_size - len(decoder.getstate()[0])
+                    text_ref = raw_ref if current == raw_path and text_size == raw_size else self.put_file(current, text_size)
+                    text_path = self.path(text_ref)
+                else:
+                    text_path = work / "text.txt"
+                    with current.open("rb") as incoming, text_path.open("wb") as output:
+                        while chunk := incoming.read(PREVIEW_BYTES):
+                            text = decoder.decode(chunk)
+                            result[prefix + "_body_binary"] |= "\x00" in text or "\ufffd" in text
+                            output.write(text.encode("utf-8"))
+                        final = decoder.decode(b"", final=complete)
+                        result[prefix + "_body_binary"] |= "\x00" in final or "\ufffd" in final
+                        output.write(final.encode("utf-8"))
+                    text_ref = self.put_file(text_path)
+                    text_size = text_path.stat().st_size
                 with text_path.open("rb") as incoming:
                     text_preview = incoming.read(PREVIEW_BYTES).decode("utf-8", errors="ignore")
                 result.update({prefix + "_text_ref": text_ref, prefix + "_text_size": text_size,

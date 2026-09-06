@@ -162,7 +162,9 @@ def create_app(config: Config | None = None) -> FastAPI:
     @api.get("/status")
     def status():
         demo_status = {"running": False, "state": "demo", "detail": "演示模式，不操作真实网络"}
-        return {"mode": "demo" if config.demo else "live", "passive_only": config.passive_only, "port": config.port, "proxy_port": config.proxy_port,
+        return {"mode": "demo" if config.demo else "live", "passive_only": config.passive_only, "inspection_profile": config.inspection_profile,
+                "newapi_upstream": config.newapi_upstream, "newapi_reverse_port": config.newapi_reverse_port,
+                "port": config.port, "proxy_port": config.proxy_port,
                 "proxy_host": config.proxy_host, "capture": demo_status if config.demo else network.status(),
                 "proxy": demo_status if config.demo else proxy.status(), "docker": demo_status if config.demo else inventory.status(),
                 "stats": store.stats(), "protected_ports": config.protected_ports, "max_records": config.max_records,
@@ -199,7 +201,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                 raise HTTPException(400, str(exc)) from exc
 
     def preflight_settings(values):
-        if values["capture_enabled"] and values["interfaces"] != "any":
+        if values["inspection_profile"] == "network" and values["capture_enabled"] and values["interfaces"] != "any":
             available = {name for _, name in socket.if_nameindex()}
             missing = set(values["interfaces"].split(",")) - available
             if missing:
@@ -211,9 +213,13 @@ def create_app(config: Config | None = None) -> FastAPI:
             owned = [(entry[0], entry[4][0], config.port) for entry in socket.getaddrinfo(config.host, config.port, type=socket.SOCK_STREAM)]
         if proxy.status().get("running"):
             owned += [(entry[0], entry[4][0], config.proxy_port) for entry in socket.getaddrinfo(config.proxy_host, config.proxy_port, type=socket.SOCK_STREAM)]
-        listeners = [(values["host"], values["port"])]
+        if proxy.status().get("reverse", {}).get("running"):
+            owned += [(entry[0], entry[4][0], config.newapi_reverse_port) for entry in socket.getaddrinfo(config.proxy_host, config.newapi_reverse_port, type=socket.SOCK_STREAM)]
+        listeners = [(values["host"], values["port"]) ]
         if values["proxy_enabled"]:
             listeners.append((values["proxy_host"], values["proxy_port"]))
+            if values["inspection_profile"] == "newapi" and values["newapi_upstream"]:
+                listeners.append((values["proxy_host"], values["newapi_reverse_port"]))
         tested = set()
         # Uvicorn binds every resolved address, including localhost's IPv4 and IPv6.
         with ExitStack() as probes:
@@ -258,7 +264,8 @@ def create_app(config: Config | None = None) -> FastAPI:
                         "instance_id": instance_id, "next": {"host": values["host"], "port": values["port"],
                         "token_changed": values["token"] != current_settings["token"]}}
             if config.demo:
-                config.passive_only = values["passive_only"]
+                for name in ("passive_only", "inspection_profile", "newapi_upstream", "newapi_reverse_port"):
+                    setattr(config, name, values[name])
                 current_settings = values
                 return response
             restart_scheduled = True
@@ -269,9 +276,9 @@ def create_app(config: Config | None = None) -> FastAPI:
             return response
 
     @api.get("/records")
-    def records(q: str = Query(default="", max_length=512), protocol: str = "", container_id: str = "", state: str = "", source: str = "",
+    def records(q: str = Query(default="", max_length=512), protocol: str = "", container_id: str = "", state: str = "", source: str = "", capture_leg: Literal["", "client", "upstream"] = "",
                 limit: int = Query(default=100, ge=1, le=200), offset: int = Query(default=0, ge=0)):
-        return store.query(q=q, protocol=protocol, container_id=container_id, state=state, source=source, limit=limit, offset=offset)
+        return store.query(q=q, protocol=protocol, container_id=container_id, state=state, source=source, capture_leg=capture_leg, limit=limit, offset=offset)
 
     def get_record(record_id: str):
         record = store.get(record_id)
@@ -365,7 +372,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                             headers={"X-Body-Complete": str(bool(meta.get("complete"))).lower()})
 
     @api.get("/records/{record_id}/readable/{side}")
-    def record_readable(record_id: str, side: Literal["request", "response"]):
+    def record_readable(record_id: str, side: Literal["request", "response"], presentation: Literal["auto", "prompt"] = "auto"):
         record = get_record(record_id)
         body_available(record, side)
         headers = {str(k).lower(): str(v) for k, v in record.get(side + "_headers", [])}
@@ -392,7 +399,7 @@ def create_app(config: Config | None = None) -> FastAPI:
             else:
                 ref = record.get(side + "_body_ref") or store.bodies.put(store.bodies.read_body(record, side))
                 path = store.bodies.path(ref)
-            meta = readable.build("record:" + record_id + ":" + side, path, **options)
+            meta = readable.build("record:" + record_id + ":" + side, path, presentation=presentation, side=side, **options)
         except (OSError, ValueError) as exc:
             raise HTTPException(410, "正文不可读取或无法生成解析视图，请检查原文") from exc
         return readable_links(meta, "/api/records/" + quote(record_id, safe="") + "/readable/" + side)

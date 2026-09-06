@@ -2,9 +2,11 @@
 
 [源码仓库](https://github.com/10dian-ai/RequestWatch) · [AGPL-3.0-only](LICENSE) · [验证记录](VERIFICATION.md)
 
-部署在 Ubuntu 的本机与 Docker 网络调试工具。**Web UI 默认端口 7030**，HTTP/HTTPS 代理默认端口 8080。
+部署在 Ubuntu 的 New API 请求观察工具，保留通用 Docker/TCP/UDP 调试能力。**Web UI 默认端口 7030**；New API 上游正向代理默认 8080，客户端入口反向代理默认 8081（填写 New API 地址后启用）。
 
-默认以**只读观察**方式运行：捕获网络副本、搜索完整内容、按容器筛选，不暂停、修改或重发真实流量。列表采用紧凑浅蓝布局，桌面记录行高 72px；点击「查看详情」直接并列展示 HTTP 请求体和响应体，TCP 包直接展示关联会话的双向正文。正文使用大字号深色文字，支持全文查找和下载。
+默认使用 **New API 专注模式 + 只读观察**：保存经过代理的完整 HTTP 请求和响应，不启动全机 Scapy 抓包、不重组无关 TCP 会话。列表可按「客户端 → New API」「New API → 供应商」筛选，详情并列展示完整输入 prompt 与回复，支持思考内容、工具调用、流式增量及全文查找。原始 JSON/SSE、请求头、响应头和原始正文下载保留。
+
+界面保持紧凑浅蓝列表、72px 桌面行高、16px 深色正文；内容不变时复用列表与正文，大正文分块排版，保存并显示全部字符，全文仍可搜索与下载。通用 TCP/UDP 抓包需在「项目设置」选择「通用网络」模式；暂停、修改与重发仍须明确关闭只读观察。
 
 ## 一键部署（Ubuntu 24.04+）
 
@@ -23,6 +25,40 @@ sudo cat /var/lib/requestwatch/admin-token
 脚本下载本仓库源码，安装运行依赖，配置 systemd 并启动服务；重复执行可更新程序，保留已有配置、数据库和 CA。默认代理只监听本机8080，安装后在面板「项目设置」调整，无需逐项编辑 SSH 配置；Docker容器接入方法见后文。需要服务器能访问 GitHub 和 Ubuntu/PyPI 软件源。
 
 如需固定版本，可把安装命令末尾改为 `sudo env RW_REF=<分支名或版本标签或commit> bash`。这固定下载的项目源码版本；引导脚本本身仍来自命令中指定的 main。
+
+## New API：同时查看两段 prompt 和响应
+
+这两段是不同的 HTTP 请求。New API 可能改模型名、添加 system prompt 或转换协议，所以分别保存；记录的链路标签来自实际代理入口，不根据包端口猜测。旧记录显示「未标记链路」。
+
+```text
+客户端 → RequestWatch 反向入口 :8081 → New API
+New API → RequestWatch 正向代理 :8080 → 模型供应商
+                     Web 面板 :7030
+```
+
+1. 在「项目设置」选择 **New API 专注模式**，启用 HTTP 代理。安装在 Ubuntu 宿主机时，可从 Docker 容器下拉框填入 New API 发布端口；存在多个可用端口时请选定实际服务地址。常见地址是 `http://127.0.0.1:3000`，填写的是 RequestWatch 能访问的 New API 地址。只有同一 Docker 网络内才可使用 `http://new-api:3000` 等服务名。
+2. 保存并应用设置，确认正向和反向代理均运行。把客户端 API Base URL 改为反向入口，例如 `http://服务器IP:8081/v1`；若已有 Nginx/Caddy HTTPS 入口，改它的上游为该反向入口。客户端仍使用自己的 New API Bearer 密钥。反向入口不使用正向代理认证；应沿用现有 HTTPS 和访问控制。
+3. 为 New API 容器设置上游代理并信任 RequestWatch CA。面板的「接入指南」包含示例与证书下载。以下内容**合并到已有 New API Compose 服务**，不要替换整个 Compose 文件：
+
+```yaml
+extra_hosts:
+  - "host.docker.internal:host-gateway"
+environment:
+  HTTP_PROXY: http://host.docker.internal:8080
+  HTTPS_PROXY: http://host.docker.internal:8080
+  NO_PROXY: localhost,127.0.0.1,::1
+  SSL_CERT_DIR: /etc/ssl/certs:/certs
+volumes:
+  - /var/lib/requestwatch/mitmproxy/mitmproxy-ca-cert.pem:/certs/requestwatch-ca.crt:ro
+```
+
+这是宿主机一键安装、默认数据目录与端口的示例。先启用代理以生成 CA 文件；在面板将代理监听地址设为容器可达的宿主机地址，或 `0.0.0.0` 并限制访问来源。若设置了正向代理认证，代理 URL 须带 URL 编码后的用户名/密码。Compose 改动后重建对应 New API 服务，使环境变量和挂载生效；以后 RequestWatch 自身的运行设置可直接从面板调整。
+
+New API 的普通 HTTP 请求支持环境代理，但渠道单独设置的代理可能覆盖它；已有渠道代理也需指向 RequestWatch，`NO_PROXY` 中的目标则会绕过环境代理。此行为根据 [New API HTTP 客户端实现](https://github.com/QuantumNous/new-api/blob/main/service/http_client.go) 与 [渠道请求实现](https://github.com/QuantumNous/new-api/blob/main/relay/channel/api_request.go) 核对。Linux 下 Go 的 CA 目录可通过冒号分隔的 `SSL_CERT_DIR` 添加，因此示例保留系统证书目录，见 [Go SystemCertPool 文档](https://pkg.go.dev/crypto/x509#SystemCertPool)。
+
+4. 发起一条新的聊天请求，在面板分别筛选两段链路。默认「Prompt / 回复」查看结构化内容，「原始 JSON / 事件」看完整 JSON/SSE；头信息可展开，下载支持原始正文与重建的 HTTP 消息。
+
+**更新 RequestWatch 不会自动修改 New API 的流量路由或信任库。** 两段只有实际经过对应代理才可观察；直接访问 New API 原端口会绕过客户端入口。HTTPS 上游必须信任 CA；WebSocket / Realtime 帧当前不作为完整聊天会话支持。旧版未捕获或已截掉的内容不能补回。
 
 ## 当前能力
 
@@ -54,7 +90,7 @@ sudo cat /var/lib/requestwatch/admin-token
 
 打开面板导航中的 **「项目设置」**，修改后点击 **「保存设置」→「重启服务并应用」**。面板会列出待应用字段，应用前检查监听地址/端口；监听地址变更后给出新的访问链接；若新配置启动失败，会自动恢复上次可用设置，回到原地址和原令牌。
 
-可调整：Web 监听地址/端口、管理令牌、只读观察模式、抓包开关、网卡、NFQUEUE 编号、额外保护端口、等待数量、规则默认超时、代理开关/地址/端口/认证、mitmdump 路径、记录保留数量和 TCP 会话空闲时间。访问令牌支持在面板生成与轮换，代理认证支持明确清除；查询接口不返回这些秘密的明文。
+可调整：观察模式、New API 目标地址/入口端口、Web 监听地址/端口、管理令牌、只读观察模式、抓包开关、网卡、NFQUEUE 编号、额外保护端口、等待数量、规则默认超时、代理开关/地址/端口/认证、mitmdump 路径、记录保留数量和 TCP 会话空闲时间。访问令牌支持在面板生成与轮换，代理认证支持明确清除；查询接口不返回这些秘密的明文。
 
 设置保存在 `/var/lib/requestwatch/settings.json`，覆盖环境变量和命令行的初始值，升级保留。点击应用后程序先停止现有网络引擎并重载配置；当前连接可能中断，待处理记录在重启后失效。通过一键安装或 `requestwatch` / `python -m requestwatch` 启动时均支持面板重启。演示设置独立保存且只模拟应用。
 
@@ -71,7 +107,7 @@ python3 -m venv .venv
 sudo .venv/bin/python -m requestwatch --host 0.0.0.0 --port 7030
 ```
 
-使用 --no-capture 可仅运行代理及控制台；--no-proxy 可仅运行原始抓包。Windows/macOS 不能运行本项目的 Linux 内核拦截引擎，但可以运行操作台和 HTTP 代理。
+New API 模式默认仅运行代理及控制台；通用网络模式下使用 --no-capture 关闭原始抓包，--no-proxy 关闭 HTTP 代理。Windows/macOS 不能运行本项目的 Linux 内核拦截引擎，但可以运行操作台和 HTTP 代理。
 
 ### 本地界面演示
 
@@ -141,7 +177,7 @@ services:
 
 ## 操作流程
 
-1. 打开 7030 页面登录，确认抓包/代理引擎状态。
+1. 打开 7030 页面登录，选择观察模式并确认相应代理/抓包引擎状态。
 2. 在「网络流量」叠加关键词、协议、容器和状态筛选；点击记录查看请求、响应、概要或 HEX。
 3. 在「拦截规则」创建窄范围规则。原始包目标地址支持 IP/CIDR；HTTP 支持目标主机文字匹配。
 4. 命中规则后打开「拦截队列」，选择记录。直接放行或编辑后放行；丢弃则终止对应包/HTTP 请求。
@@ -156,7 +192,7 @@ services:
 
 首页「累计捕获」持续增加，「当前保留」受设置中的保留上限约束。达到默认 10000 条后，新记录替换旧记录，保留数会保持不变；最近捕获时间和累计数用于判断是否仍有流量。更新旧版本时以现存记录作为累计基线，先前已淘汰的数量无法追溯，页面会明确说明。
 
-HTTP 正文与 TCP 会话默认使用「自动解析」：识别 HTTP/1 分块、gzip/deflate、JSON 与 SSE 流式事件，将常见聊天增量拼接成正文，单独显示思考字段，同时保留完整事件明细。换行与 Unicode 转义会被解码，不再把分块长度当正文显示。可以切回原文、HEX，并分别下载解析文本或原始字节。
+New API 模式的 HTTP 详情默认使用「Prompt / 回复」，支持 OpenAI Chat、Responses、Anthropic 与 Gemini 的常见请求/响应结构；不识别或超过解析预算时回退完整原文并说明原因。其他 HTTP 正文与 TCP 会话可使用「自动解析」：识别 HTTP/1 分块、gzip/deflate、JSON 与 SSE 流式事件，将常见聊天增量拼接成正文，单独显示思考字段，同时保留完整事件明细。换行与 Unicode 转义会被解码，不再把分块长度当正文显示。可以切回原文、HEX，并分别下载解析文本或原始字节。
 
 解析是对已捕获内容的辅助视图，原始数据不会被替换。没有 HTTP 头时仅在结构匹配时推断分块格式并标记不完整；缺口、截断或重传冲突不跨片段拼接；TLS 密文不会被伪装成明文。超过单事件 JSON 解析预算时完整保留事件文本并提示，不截断文件。没有配对请求上下文的 HEAD/CONNECT 响应边界无法保证判断，需以原文或 HTTP 代理记录核对。
 
@@ -164,11 +200,11 @@ HTTP 正文与 TCP 会话默认使用「自动解析」：识别 HTTP/1 分块�
 
 网络包列表只提供摘要。打开详情后会重新读取该包的全部已保存字节；失败时显示原因与重试入口，不会把 240 字摘要标为全文。一个 TCP 包只包含连接中的一个片段，默认正文页直接载入同一连接的双向重组内容；「单包载荷」与 HEX 保留原始包的查看方式。没有载荷的 ACK、握手包以及已淘汰的会话会明确提示。
 
-HTTP/HTTPS 代理的响应边接收边转发，并约每秒保存一次已收到的正文快照，SSE 不用等连接关闭后才显示。SSE 固定按 UTF-8 解码，支持 gzip、deflate、Brotli、Zstandard 等压缩；旧版本错误解码的 SSE 可从仍保留的原始正文重新生成文本。流式正文进行中会标记未结束，中断时保留已收到的部分，不将其标成完整响应。
+HTTP/HTTPS 代理的响应边接收边转发，首段及时保存，中间快照按增长量每 1–5 秒合并保存，结束时立即保存最终全文；SSE 不用等连接关闭后才显示。正文原始字节持续写入临时文件，合并的是界面快照，并不跳过内容。SSE 固定按 UTF-8 解码，支持 gzip、deflate、Brotli、Zstandard 等压缩；旧版本错误解码的 SSE 可从仍保留的原始正文重新生成文本。流式正文进行中会标记未结束，中断时保留已收到的部分，不将其标成完整响应。
 
 尚未收完响应的 HTTP 记录不会被包数量上限提前淘汰，因此大量同时进行的响应可临时使保留数超过上限。代理每 10 秒确认活动连接；连续 120 秒未确认会标为采集失联、完整性未知，保留已有正文并停止永久占用活动名额。代理重启后无法继续原连接。服务停止时先停止抓包，再保存观察队列里已有的包。
 
-只读采集不安装 NFQUEUE/iptables 拦截规则，也不执行暂停规则。抓取副本按最多 512 条或约 4 MiB 一批写入数据库和 TCP 文件，完整保留原字节；批次复用文件句柄，避免每包重复提交。副本保存跟不上时会明确显示未保存副本计数与队列状态；该计数不代表真实连接的网络包因此被丢弃，也不涵盖内核丢包。受抓包开始时间、网卡可见范围、保护端口排除、IP 分片、TLS 加密和存储保留上限影响，系统不能补回从未捕获或已淘汰的字节。TCP 原始导出按顺序包含已观测范围，缺口不补字节；文本解码不会把缺口两边残余字节拼成同一个字符。
+通用网络模式的只读采集不安装 NFQUEUE/iptables 拦截规则，也不执行暂停规则。抓取副本按最多 512 条或约 4 MiB 一批写入数据库和 TCP 文件，完整保留原字节；批次复用文件句柄，避免每包重复提交。副本保存跟不上时会明确显示未保存副本计数与队列状态；该计数不代表真实连接的网络包因此被丢弃，也不涵盖内核丢包。受抓包开始时间、网卡可见范围、保护端口排除、IP 分片、TLS 加密和存储保留上限影响，系统不能补回从未捕获或已淘汰的字节。TCP 原始导出按顺序包含已观测范围，缺口不补字节；文本解码不会把缺口两边残余字节拼成同一个字符。
 
 ### 完整内容如何保存
 
@@ -188,7 +224,7 @@ HTTP/HTTPS 代理的响应边接收边转发，并约每秒保存一次已收到
 - TCP 原始包丢弃不是取消应用请求；发送方可能再次重传。TCP 载荷重发不是原连接恢复，不复用原序列号、TLS 握手或容器身份。新连接的结果取决于应用协议；UDP 也可能因认证或状态要求不能独立重发。
 - 抓取宿主机可见的网络接口并动态识别新增接口。容器内部 loopback 不经过宿主机网络；某些 bridge 路径是否经过 Netfilter 依赖 br_netfilter 配置。此类路径不承诺全部可见。
 - 容器归属基于 Docker 公共网络 IP。host 网络、共享 IP、rootless Docker、NAT 后地址及跨命名空间路径可能显示「未知来源」；不会伪造精确归属。Docker socket 查询只读，但进程按用户选择以 root 运行。
-- HTTP 正文无固定 1 MiB 保存上限，实际受可用磁盘与内存限制。代理需要缓冲完整 HTTP 消息用于修改，浏览器全文视图也会占用内存；响应需接收结束才有完整正文。WebSocket 消息、无限 SSE 流未单独解析。
+- HTTP 正文无固定 1 MiB 保存上限，实际受可用磁盘与内存限制。请求需要缓冲完整 HTTP 消息，浏览器全文视图也会占用内存；响应流式落盘，接收结束后才标为完整。无限 SSE 保留收到的内容并维持进行中状态；WebSocket 消息帧未单独捕获。
 - 默认保留最近 10000 条记录和最近 10000 个 TCP 会话；会话 5 分钟无包后再次出现会另起会话。正文文件在所属记录淘汰后延迟至少 10 分钟清理；TCP 会话文件随会话淘汰。数量上限并非磁盘容量上限，长会话和大正文仍会占用大量空间。SQLite 复用已分配空间，数据保存在 /var/lib/requestwatch。
 
 ## 配置项
@@ -201,7 +237,10 @@ HTTP/HTTPS 代理的响应边接收边转发，并约每秒保存一次已收到
 | RW_PORT | 7030 | Web端口 |
 | RW_DATA_DIR | data（安装服务为/var/lib/requestwatch） | 持久数据 |
 | RW_TOKEN | 自动生成并保存 | Web/API令牌，至少16字符 |
-| RW_CAPTURE | true | 启用Linux抓包 |
+| RW_INSPECTION_PROFILE | newapi | newapi 专注模式；network 通用网络模式 |
+| RW_NEWAPI_UPSTREAM | 空 | New API 的 HTTP/HTTPS 源站地址；空值不启用反向入口 |
+| RW_NEWAPI_REVERSE_PORT | 8081 | 客户端 → New API 反向入口端口，共用代理监听地址 |
+| RW_CAPTURE | true | 通用网络模式下启用 Linux 抓包，New API 模式忽略此开关 |
 | RW_PASSIVE_ONLY | true | 只读观察，不暂停、改写或重发；不安装原始包拦截规则 |
 | RW_INTERFACES | any | 全部接口，或逗号分隔的接口名 |
 | RW_QUEUE_NUM | 7030 | 独占NFQUEUE编号 |
@@ -259,7 +298,7 @@ sudo env RW_QUEUE_NUM=7030 python3 /opt/requestwatch/scripts/cleanup_firewall.py
 - requestwatch/runtime.py / store.py / rules.py：拦截生命周期、SQLite、组合规则
 - requestwatch/network.py：被动捕获与 NFQUEUE
 - requestwatch/body_store.py：完整HTTP正文文件
-- requestwatch/stream_decode.py / readable_cache.py：HTTP/JSON/SSE 可读解析与临时快照
+- requestwatch/stream_decode.py / prompt_view.py / readable_cache.py：HTTP/JSON/SSE 与多协议 Prompt 可读解析及临时快照
 - requestwatch/settings.py：面板设置校验、脱敏及原子保存
 - requestwatch/tcp_streams.py：持久化TCP双向序列重组及全文搜索
 - requestwatch/dockerinfo.py：Docker 容器归属

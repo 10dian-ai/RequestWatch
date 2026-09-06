@@ -498,7 +498,7 @@ class ReceivedWireFrame:
         return self.layer if name == "IP" else None
 
 
-def test_real_config_defaults_to_readonly_and_never_installs_nfqueue(tmp_path):
+def test_network_profile_defaults_to_readonly_and_never_installs_nfqueue(tmp_path):
     import time
     from requestwatch.config import Config
 
@@ -518,7 +518,7 @@ def test_real_config_defaults_to_readonly_and_never_installs_nfqueue(tmp_path):
         def stop(self):
             self.running = False
 
-    config = Config(data_dir=tmp_path, token="readonly-capture-test-token")
+    config = Config(data_dir=tmp_path, token="readonly-capture-test-token", inspection_profile="network")
     config.prepare()
     assert config.passive_only is True
     runtime = FakeRuntime(intercept=True)  # Even existing enabled packet rules cannot activate queueing.

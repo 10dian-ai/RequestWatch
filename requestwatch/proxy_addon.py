@@ -43,6 +43,9 @@ PREVIEW_BYTES = 64 * 1024
 API_OUTAGE_SECONDS = 3.0
 POLL_SECONDS = 0.20
 HEARTBEAT_SECONDS = 10.0
+STREAM_SNAPSHOT_MIN_SECONDS = 1.0
+STREAM_SNAPSHOT_MAX_SECONDS = 5.0
+STREAM_SNAPSHOT_GROWTH_BYTES = 256 * 1024
 TOKEN_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 log = logging.getLogger("requestwatch.proxy")
 
@@ -191,6 +194,24 @@ def edited_request(request: Any, edits: dict[str, Any]) -> Any:
     return changed
 
 
+def stream_snapshot_due(size, previous_size, elapsed):
+    """Publish the first bytes promptly, then coalesce immutable body copies.
+
+    Small token deltas do not justify copying an ever-growing body every second.
+    A substantial increase can publish sooner; quiet growth is visible within
+    five seconds. The tee still saves every received byte immediately and EOF
+    always publishes a final complete snapshot, independently of this schedule.
+    """
+    if size == previous_size:
+        return False
+    if previous_size <= 0:
+        return True
+    if elapsed < STREAM_SNAPSHOT_MIN_SECONDS:
+        return False
+    growth = max(STREAM_SNAPSHOT_GROWTH_BYTES, previous_size // 2)
+    return size - previous_size >= growth or elapsed >= STREAM_SNAPSHOT_MAX_SECONDS
+
+
 class ResponseCapture:
     """A lossless tee: append encoded body bytes, return precisely the input chunk."""
     def __init__(self, body_store):
@@ -231,6 +252,8 @@ class RequestWatchAddon:
         self.client = client
         self.body_store = body_store
         self.data_dir = os.getenv("RW_DATA_DIR")
+        leg = os.getenv("RW_CAPTURE_LEG", "")
+        self.capture_leg = leg if leg in {"client", "upstream"} else ""
         self._tasks: set[asyncio.Task] = set()
         self._updates: dict[str, asyncio.Task] = {}
         self._streams: dict[str, ResponseCapture] = {}
@@ -397,6 +420,8 @@ class RequestWatchAddon:
             "http_in_flight": True,
             "payload_text": self._search_text(request, snapshot), **snapshot,
         }
+        if self.capture_leg:
+            record["capture_leg"] = self.capture_leg
         # A timed-out POST may already have committed. Keep the known record ID
         # so subsequent response/error updates can still complete that same record.
         flow.metadata["rw_id"] = flow.id
@@ -480,9 +505,11 @@ class RequestWatchAddon:
 
         async def publish_periodically():
             last_size = -1
+            last_published = time.monotonic()
             while not capture.stop.is_set():
                 size = capture.size
-                if size != last_size:
+                now = time.monotonic()
+                if stream_snapshot_due(size, last_size, now - last_published):
                     snapshot = await self._stream_snapshot(flow, capture, size, False)
                     self._update_later(flow.metadata["rw_id"], self._stream_changes(flow, snapshot, False))
                     # Coalesce while the management API is slow; never accumulate
@@ -491,8 +518,9 @@ class RequestWatchAddon:
                     if pending is not None:
                         await pending
                     last_size = size
+                    last_published = now
                 try:
-                    await asyncio.wait_for(capture.stop.wait(), timeout=1.0)
+                    await asyncio.wait_for(capture.stop.wait(), timeout=STREAM_SNAPSHOT_MIN_SECONDS)
                 except asyncio.TimeoutError:
                     pass
         capture.task = asyncio.create_task(publish_periodically())

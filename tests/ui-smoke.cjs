@@ -189,7 +189,8 @@ const {chromium} = require(process.env.RW_PLAYWRIGHT_MODULE || 'playwright-core'
   await closeDrawer();
   await page.locator('.navigation [data-view="containers"]').click();
   await page.locator('.container-card').first().waitFor();
-  assert.equal(await page.locator('.container-card').count(), 2);
+  assert.equal(await page.locator('.container-card').count(), 3);
+  assert.equal(await page.locator('.container-card').filter({hasText: 'new-api-demo'}).count(), 1);
   await closeDrawer();
   await page.locator('.navigation [data-view="traffic"]').click();
   await page.locator('#reset-filters').click();

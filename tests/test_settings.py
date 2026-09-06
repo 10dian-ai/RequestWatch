@@ -21,6 +21,7 @@ AUTH = "tester:private-password"
 def test_all_fields_validate_and_normalize():
     settings = SettingsInput(
         host="0.0.0.0", port=7030, interfaces=["eth0", "docker0", "eth0"],
+        inspection_profile="newapi", newapi_upstream="http://new-api:3000", newapi_reverse_port=8081,
         capture_enabled=True, passive_only=True, queue_num=7030, protected_ports=[8080, 22, 22],
         proxy_enabled=False, proxy_host="::1", proxy_port=8080, proxy_auth=AUTH,
         max_records=20000, pending_limit=256, mitmdump="/opt/requestwatch/.venv/bin/mitmdump",

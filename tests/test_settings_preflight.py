@@ -98,3 +98,16 @@ def test_current_ipv4_port_does_not_exempt_a_busy_ipv6_address(tmp_path):
                 saved = client.put("/api/settings", json={"host": "::1"})
                 assert saved.status_code == 200, saved.text
                 assert_failed_apply_keeps_panel_editable(client, app, called, current_port)
+
+
+def test_busy_newapi_reverse_port_rejects_apply_without_restart(tmp_path):
+    with occupied_listener("127.0.0.1") as current_port, occupied_listener("127.0.0.1") as busy_port:
+        app = make_app(tmp_path, current_port)
+        called = []
+        app.state.request_restart = lambda: called.append(True)
+        with TestClient(app) as client:
+            client.headers["Authorization"] = "Bearer " + TOKEN
+            saved = client.put("/api/settings", json={"inspection_profile": "newapi", "proxy_enabled": True,
+                "proxy_port": 48080, "newapi_upstream": "http://127.0.0.1:3000", "newapi_reverse_port": busy_port})
+            assert saved.status_code == 200, saved.text
+            assert_failed_apply_keeps_panel_editable(client, app, called, current_port)

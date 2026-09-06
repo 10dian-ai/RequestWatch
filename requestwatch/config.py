@@ -17,6 +17,9 @@ class Config:
     port: int = field(default_factory=lambda: int(os.getenv("RW_PORT", "7030")))
     data_dir: Path = field(default_factory=lambda: Path(os.getenv("RW_DATA_DIR", "data")))
     token: str = field(default_factory=lambda: os.getenv("RW_TOKEN", ""))
+    inspection_profile: str = field(default_factory=lambda: os.getenv("RW_INSPECTION_PROFILE", "newapi"))
+    newapi_upstream: str = field(default_factory=lambda: os.getenv("RW_NEWAPI_UPSTREAM", ""))
+    newapi_reverse_port: int = field(default_factory=lambda: int(os.getenv("RW_NEWAPI_REVERSE_PORT", "8081")))
     capture_enabled: bool = field(default_factory=lambda: env_bool("RW_CAPTURE", True))
     passive_only: bool = field(default_factory=lambda: env_bool("RW_PASSIVE_ONLY", True))
     interfaces: str = field(default_factory=lambda: os.getenv("RW_INTERFACES", "any"))
@@ -37,7 +40,7 @@ class Config:
     def prepare(self) -> None:
         self.data_dir = Path(self.data_dir).resolve()
         self.data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        from .settings import SettingsStore, validate_settings
+        from .settings import SettingsStore, validate_settings, reverse_proxy_enabled
         settings_store = SettingsStore(self.data_dir / "demo" if self.demo else self.data_dir)
         self._settings_store = settings_store
         saved = settings_store.load()
@@ -45,11 +48,15 @@ class Config:
         if not base["token"]:
             base.pop("token")
         validate_settings(saved, base)
+        validate_settings({**base, **saved})
         if not self.demo:
             for name, value in saved.items():
                 setattr(self, name, value)
         self.extra_protected_ports = tuple(self.protected_ports)
-        self.protected_ports = tuple(sorted({self.port, self.proxy_port, *self.extra_protected_ports}))
+        ports = {self.port, self.proxy_port, *self.extra_protected_ports}
+        if reverse_proxy_enabled(self.settings_values()):
+            ports.add(self.newapi_reverse_port)
+        self.protected_ports = tuple(sorted(ports))
         self._settings_prepared = True
         if not all(1 <= p <= 65535 for p in self.protected_ports):
             raise ValueError("端口必须在 1–65535 范围内")
@@ -82,7 +89,7 @@ class Config:
                     os.unlink(temporary)
 
     def settings_values(self):
-        names = ("host", "port", "capture_enabled", "passive_only", "interfaces", "queue_num", "pending_limit",
+        names = ("host", "port", "inspection_profile", "newapi_upstream", "newapi_reverse_port", "capture_enabled", "passive_only", "interfaces", "queue_num", "pending_limit",
                  "max_records", "proxy_enabled", "proxy_host", "proxy_port", "proxy_auth", "token",
                  "default_timeout_seconds", "tcp_idle_timeout", "mitmdump")
         result = {name: getattr(self, name) for name in names}

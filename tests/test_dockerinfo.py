@@ -65,6 +65,18 @@ class DockerInventoryTests(unittest.TestCase):
         self.assertFalse(inventory.status()["available"])
         self.assertEqual(inventory.identify("172.18.0.2", "1.1.1.1")["attribution"], "unknown")
 
+    def test_published_ports_preserve_binding_and_defensive_copy(self):
+        item = row("a", "new-api", "172.18.0.2")
+        item["Ports"] = [{"PrivatePort": 3000, "PublicPort": 13000, "IP": "127.0.0.1", "Type": "tcp"},
+                         {"PrivatePort": 9090, "Type": "tcp"}]
+        inventory = DockerInventory(client_factory=lambda: FakeClient([item]))
+        inventory.refresh()
+        ports = inventory.list()[0]["ports"]
+        self.assertEqual(ports, [{"private_port": 3000, "public_port": 13000, "ip": "127.0.0.1", "type": "tcp"},
+                                 {"private_port": 9090, "public_port": None, "ip": "", "type": "tcp"}])
+        ports[0]["public_port"] = 1
+        self.assertEqual(inventory.list()[0]["ports"][0]["public_port"], 13000)
+
     def test_list_is_defensive_copy(self):
         inventory = DockerInventory(client_factory=lambda: FakeClient([row("a", "api", "172.18.0.2")]))
         inventory.refresh()

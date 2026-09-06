@@ -11,6 +11,9 @@
   let searchTimer;
   let toastTimer;
   let confirmResolve;
+  const recordRows = new Map();
+  const bodyPanes = new Map();
+  const detailRenderKeys = new WeakMap();
   const bodyCache = new Map();
   const hexCache = new Map();
   const readableCache = new Map();
@@ -26,11 +29,26 @@
   const paneSearchValues = new Map();
   let sessionSearchTimer;
   const settingsState = { data: null, dirty: false, saving: false, applying: false, pendingToken: '', restartDone: false };
-  const settingNames = { host: 'Web 监听地址', port: '工作台端口', token: '管理令牌', passive_only: '只读观察', capture_enabled: '抓包开关', interfaces: '网卡', queue_num: 'NFQUEUE 队列', protected_ports: '保护端口', pending_limit: '暂停容量', default_timeout_seconds: '规则默认等待', proxy_enabled: '代理开关', proxy_host: '代理地址', proxy_port: '代理端口', proxy_auth: '代理认证', mitmdump: 'mitmdump 路径', max_records: '保留记录数', tcp_idle_timeout: 'TCP 空闲超时' };
+  const settingNames = { inspection_profile: '采集用途', newapi_upstream: 'NewAPI 实际地址', newapi_reverse_port: 'NewAPI 接入端口', host: 'Web 监听地址', port: '工作台端口', token: '管理令牌', passive_only: '只读观察', capture_enabled: '抓包开关', interfaces: '网卡', queue_num: 'NFQUEUE 队列', protected_ports: '保护端口', pending_limit: '暂停容量', default_timeout_seconds: '规则默认等待', proxy_enabled: '代理开关', proxy_host: '代理地址', proxy_port: '代理端口', proxy_auth: '代理认证', mitmdump: 'mitmdump 路径', max_records: '保留记录数', tcp_idle_timeout: 'TCP 空闲超时' };
 
   function element(tag, text, className) {
     const node = document.createElement(tag);
-    if (text !== undefined && text !== null) node.textContent = String(text);
+    if (text !== undefined && text !== null) {
+      const value = String(text);
+      if (tag === 'pre' && value.length > 131072 && !className?.split(/\s+/).includes('hex')) {
+        // Keep every character while bounding each inline formatting context. A
+        // megabyte-long wrapped JSON line otherwise monopolizes browser layout.
+        // Real block heights keep scrolling stable; no estimated-height spacers.
+        for (let start = 0; start < value.length;) {
+          let end = Math.min(start + 1024, value.length);
+          if (end < value.length && /[\uD800-\uDBFF]/.test(value[end - 1])) end--;
+          const chunk = document.createElement('span'); chunk.textContent = value.slice(start, end);
+          chunk.style.cssText = 'display:inline-block;width:100%;vertical-align:top';
+          node.append(chunk); start = end;
+        }
+        node.dataset.chunked = 'true';
+      } else node.textContent = value;
+    }
     if (className) node.className = className;
     return node;
   }
@@ -137,8 +155,28 @@
     const names = { running: '运行中', connected: '已连接', ready: '就绪', active: '运行中', available: '可用', disabled: '未启用', stopped: '未启动', unavailable: '不可用', error: '异常', demo: '演示数据', starting: '启动中' };
     return { good: Boolean(good && !value.error), label: value.error ? '异常' : names[raw] || (good ? '运行中' : value.enabled === false ? '未启用' : '未连接'), detail: value.error || value.message || value.reason || value.detail || '' };
   }
+  function isNewApi() { return s.inspectionProfile === 'newapi'; }
+  function parsedHttpFormat(format) { return format === 'auto' || format === 'prompt'; }
+  function captureLegLabel(record) { return { client: '客户端 → NewAPI', upstream: 'NewAPI → 供应商' }[record.capture_leg] || '未标记链路'; }
+  function syncInspectionProfile(status) {
+    const profile = status.inspection_profile === 'newapi' ? 'newapi' : 'network';
+    if (profile === s.inspectionProfile) return;
+    s.inspectionProfile = profile; s.offset = 0;
+    if ($('newapi-setup')) $('newapi-setup').hidden = !isNewApi();
+    if ($('filter-source')) $('filter-source').value = isNewApi() ? 'http' : '';
+    if ($('filter-leg')) $('filter-leg').value = '';
+    s.bodyFormat = { request: isNewApi() ? 'prompt' : 'auto', response: isNewApi() ? 'prompt' : 'auto' };
+    bodyPanes.clear();
+    titles.traffic = isNewApi() ? 'New API 请求' : '网络流量';
+    if (s.view === 'traffic') {
+      $('breadcrumb-title').textContent = titles.traffic;
+      $('traffic-title').replaceChildren(document.createTextNode(titles.traffic), element('span', '.', 'heading-dot'));
+      $('list-heading').textContent = isNewApi() ? '请求与回复' : '所有流量';
+    }
+  }
   function renderStatus(status) {
     s.status = status;
+    syncInspectionProfile(status);
     syncReadOnlyActions();
     const stats = status.stats || {};
     ['pending', 'http', 'packets'].forEach((key) => { $(`stat-${key}`).textContent = Number(stats[key] || 0).toLocaleString('zh-CN'); });
@@ -151,13 +189,16 @@
     $('demo-notice').hidden = status.mode !== 'demo';
     $('server-port').textContent = `:${status.port || 7030}`;
     ['capture', 'proxy', 'docker'].forEach((key) => {
-      const info = engineInfo(status[key]);
+      const info = key === 'capture' && isNewApi() ? { good: true, label: 'New API模式：不抓全机包', detail: status.capture?.detail || '完整 HTTP 请求与响应通过 New API 两段代理接入。' } : engineInfo(status[key]);
       $(`${key}-state`).textContent = info.label;
       $(`${key}-state`).title = info.detail || info.label;
       $(`${key}-dot`).className = `engine-dot ${info.good ? 'online' : 'offline'}`;
     });
     const droppedPackets = Number(status.capture?.passive_dropped || 0);
     message('capture-loss-alert', droppedPackets > 0 ? `采集程序曾落后，${droppedPackets.toLocaleString('zh-CN')} 个抓包副本未保存，查看内容可能有缺口；原连接没有因此丢包。` : '', 'warning');
+    if ($('guide-newapi-forward')) $('guide-newapi-forward').textContent = `New API → RequestWatch :${status.proxy_port || 8080} → 模型供应商`;
+    if ($('guide-newapi-reverse')) $('guide-newapi-reverse').textContent = `客户端 → RequestWatch :${status.newapi_reverse_port || 8081} → New API`;
+    if ($('guide-newapi-target')) $('guide-newapi-target').textContent = status.newapi_upstream || '尚未配置 New API 实际地址';
     $('guide-proxy-env').textContent = `HTTP_PROXY=http://<服务器IP>:${status.proxy_port || 8080}\nHTTPS_PROXY=http://<服务器IP>:${status.proxy_port || 8080}`;
     $('protected-ports').textContent = (status.protected_ports || [22, 7030, 8080]).join('、');
     $('runtime-summary').textContent = `工作台 :${status.port || 7030} · HTTP 代理 :${status.proxy_port || 8080} · ${status.mode === 'demo' ? '演示模式' : '实时模式'}。抓包：${engineInfo(status.capture).detail || engineInfo(status.capture).label}；代理：${engineInfo(status.proxy).detail || engineInfo(status.proxy).label}。`;
@@ -173,7 +214,7 @@
     $('edit-button').hidden = readonly;
     $('pending-actions').parentElement.hidden = readonly;
     $('action-help').hidden = readonly;
-    if (s.view === 'traffic') $('traffic-subtitle').textContent = readonly ? '只读查看网络请求、响应正文和 TCP 双向通信。' : '查看每一次连接，按规则暂停，在放行前检查与修改。';
+    if (s.view === 'traffic') $('traffic-subtitle').textContent = isNewApi() ? '查看客户端与 NewAPI、NewAPI 与供应商之间发送的完整 Prompt 和收到的回复。' : readonly ? '只读查看网络请求、响应正文和 TCP 双向通信。' : '查看每一次连接，按规则暂停，在放行前检查与修改。';
     message('rules-readonly-note', readonly ? '当前为只读观察模式。已保存的规则不会暂停流量，也不会修改、丢弃或重发内容。' : '');
     if (readonly) { $('edit-form').hidden = true; s.editing = false; s.draftOriginal = null; }
   }
@@ -201,7 +242,7 @@
     target.scrollTop = position?.top || 0;
     [...target.querySelectorAll('pre')].forEach((node, index) => { node.scrollTop = position?.blocks[index]?.[0] || 0; node.scrollLeft = position?.blocks[index]?.[1] || 0; });
   }
-  const readableNames = { openai: '聊天增量合并', sse: 'SSE 事件正文', json: 'JSON 格式化', http: 'HTTP 消息', 'http-sse': 'HTTP / SSE 正文', text: '文本', chunked: 'HTTP 分块正文', binary: '二进制内容', unknown: '原始内容' };
+  const readableNames = { prompt: 'Prompt / 回复', 'prompt-json': '完整 Prompt / 回复', 'prompt-sse': '流式 Prompt / 回复', 'prompt-raw': '原始正文（未识别 Prompt）', openai: '聊天增量合并', sse: 'SSE 事件正文', json: 'JSON 格式化', http: 'HTTP 消息', 'http-sse': 'HTTP / SSE 正文', text: '文本', chunked: 'HTTP 分块正文', binary: '二进制内容', unknown: '原始内容' };
   function readableLabel(meta) { return meta.label || readableNames[meta.kind] || meta.kind || '应用正文'; }
   function appendReadable(target, entry, heading, className = '', compact = false, collapseWarnings = false) {
     const meta = entry.meta || {};
@@ -236,14 +277,46 @@
     updateContainerSelect('filter-container', '全部容器 / 本机');
     updateContainerSelect('rule-container', '全部容器 / 本机');
     updateContainerSelect('session-container', '全部容器 / 本机');
+    updateNewApiContainers();
     const info = engineInfo(data.status || s.status?.docker);
     $('container-status').textContent = `${info.detail || info.label} · 发现 ${s.containers.length} 个容器。来源按网络地址关联，无法确定归属时将显示本机 / 未识别。`;
     if (s.view === 'containers') renderContainers();
   }
-  function filters() {
-    return new URLSearchParams({ q: $('filter-query').value.trim(), protocol: $('filter-protocol').value, container_id: $('filter-container').value, state: s.view === 'pending' ? 'pending' : $('filter-state').value, limit: String(s.limit), offset: String(s.offset) });
+  function updateNewApiContainers() {
+    const select = $('newapi-container-target'); if (!select) return;
+    const selected = select.value;
+    const preferred = container => /new[-_]?api/i.test(`${container.name || ''} ${container.image || ''}`);
+    const containers = [...s.containers].sort((a, b) => Number(preferred(b)) - Number(preferred(a)) || String(a.name || a.id).localeCompare(String(b.name || b.id)));
+    select.replaceChildren(new Option(containers.length ? '选择已发现的容器' : '暂无可用容器'), ...containers.map(container => new Option(`${container.name || container.id.slice(0, 12)}${preferred(container) ? ' · New API' : ''}`, container.id)));
+    if (containers.some(container => container.id === selected)) select.value = selected;
+    $('newapi-use-container').disabled = !containers.length || settingsState.data?.saved?.newapi_upstream === undefined;
   }
-  function hasFilters() { return $('filter-query').value.trim() || $('filter-protocol').value || $('filter-container').value || $('filter-state').value && s.view !== 'pending'; }
+  function useNewApiContainer() {
+    const container = s.containers.find(item => item.id === $('newapi-container-target')?.value);
+    if (!container) { toast('请先选择一个已发现的容器。', true); return; }
+    const ports = (container.ports || []).filter(port => String(port.type).toLowerCase() === 'tcp');
+    const validPort = value => Number.isInteger(value) && value >= 1 && value <= 65535;
+    const published = ports.filter(port => validPort(port.public_port));
+    let address = '';
+    if (published.length) {
+      const numbers = [...new Set(published.map(port => port.public_port))];
+      const bindings = [...new Set(published.map(port => port.ip || '0.0.0.0'))];
+      const host = bindings.some(ip => ['0.0.0.0', '::', '127.0.0.1'].includes(ip)) ? '127.0.0.1' : bindings.length === 1 ? bindings[0] : null;
+      if (numbers.length === 1 && host) address = `http://${host.includes(':') ? `[${host}]` : host}:${numbers[0]}`;
+    } else {
+      const numbers = [...new Set(ports.map(port => port.private_port).filter(validPort))];
+      const ips = [...new Set(container.ips || [])];
+      if (numbers.length === 1 && ips.length === 1) address = `http://${ips[0].includes(':') ? `[${ips[0]}]` : ips[0]}:${numbers[0]}`;
+    }
+    if (!address) { toast('此容器未提供唯一的 TCP 服务地址，可能有多个端口或网卡。请在“NewAPI 实际地址”中填写要使用的 HTTP 地址。', true); return; }
+    const input = $('setting-newapi-upstream'); if (!input || input.disabled) return;
+    input.value = address; settingsState.dirty = true; settingsControls(); input.focus({ preventScroll: true });
+    toast(`已填入 ${address}。保存并应用后生效。`);
+  }
+  function filters() {
+    return new URLSearchParams({ q: $('filter-query').value.trim(), source: $('filter-source')?.value || '', capture_leg: $('filter-leg')?.value || '', protocol: $('filter-protocol').value, container_id: $('filter-container').value, state: s.view === 'pending' ? 'pending' : $('filter-state').value, limit: String(s.limit), offset: String(s.offset) });
+  }
+  function hasFilters() { return $('filter-source')?.value || $('filter-leg')?.value || $('filter-query').value.trim() || $('filter-protocol').value || $('filter-container').value || $('filter-state').value && s.view !== 'pending'; }
   function emptyState(target, title, description, action) {
     target.replaceChildren(element('div', '≋', 'empty-glyph'), element('h3', title), element('p', description));
     if (action) { const button = element('button', action.text, 'button secondary compact'); button.addEventListener('click', action.run); target.append(button); }
@@ -252,9 +325,16 @@
   function renderRecords() {
     const focusedId = $('records-body').contains(document.activeElement) ? document.activeElement.closest('tr')?.dataset.id : null;
     const focusedDetailButton = document.activeElement?.classList.contains('event-detail-button');
-    const fragment = document.createDocumentFragment();
-    s.records.forEach((record) => {
-      const row = element('tr'); row.dataset.id = record.id; row.tabIndex = 0;
+    const target = $('records-body');
+    const visible = new Set(s.records.map(record => record.id));
+    for (const [id, cached] of recordRows) { if (!visible.has(id)) { cached.row.remove(); recordRows.delete(id); } }
+    s.records.forEach((record, index) => {
+      // List keys contain displayed metadata only, never complete bodies.
+      const key = JSON.stringify([record.id, record.source, record.protocol, record.state, record.error, record.method, record.url, record.summary, record.src_ip, record.src_port, record.dst_ip, record.dst_port, record.status_code, record.request_body_size, record.response_body_size, record.payload_size, record.created_at, record.container_name, record.container_id, record.response_streaming, record.duration_ms, record.capture_leg]);
+      const cached = recordRows.get(record.id);
+      let row = cached?.row;
+      if (cached?.key !== key) {
+      row = element('tr'); row.dataset.id = record.id; row.tabIndex = 0;
       row.classList.toggle('selected', record.id === s.selectedId);
       row.setAttribute('aria-selected', String(record.id === s.selectedId));
       row.setAttribute('aria-label', `${recordTitle(record)}，${stateNames[record.state] || record.state}`);
@@ -275,6 +355,7 @@
       const description = element('div', descriptions.join(' · '), 'event-description');
       const metadata = element('div', null, 'event-metadata');
       metadata.append(element('span', time(record.created_at, true), 'cell-time'), element('span', record.container_name || '本机 / 未识别', 'cell-container'));
+      if (record.source === 'http') metadata.append(element('span', captureLegLabel(record), 'event-capture-leg'));
       if (record.response_streaming) metadata.append(element('span', '流式接收中', 'event-streaming'));
       if (record.duration_ms !== undefined && record.duration_ms !== null) metadata.append(element('span', `${Number(record.duration_ms).toFixed(0)} ms`));
       if (record.container_id) metadata.append(element('span', String(record.container_id).slice(0, 12), 'event-container-id'));
@@ -285,9 +366,13 @@
       row.append(iconCell, main, actionCell);
       row.addEventListener('click', () => selectRecord(record.id));
       row.addEventListener('keydown', event => { if (event.target === row && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); selectRecord(record.id); } });
-      fragment.append(row);
+      cached?.row.replaceWith(row);
+      recordRows.set(record.id, { row, key });
+      }
+      row.classList.toggle('selected', record.id === s.selectedId);
+      row.setAttribute('aria-selected', String(record.id === s.selectedId));
+      if (target.children[index] !== row) target.insertBefore(row, target.children[index] || null);
     });
-    $('records-body').replaceChildren(fragment);
     if (focusedId) { const row = [...$('records-body').children].find(row => row.dataset.id === focusedId); (focusedDetailButton ? row?.querySelector('.event-detail-button') : row)?.focus({ preventScroll: true }); }
     $('records-empty').hidden = Boolean(s.records.length);
     if (!s.records.length) {
@@ -324,7 +409,14 @@
         }
         if (s.selectedId) {
           const selectedId = s.selectedId; const detailVersion = s.detailVersion;
-          try {
+          const summary = s.records.find(record => record.id === selectedId);
+          const summaryKey = summary ? JSON.stringify(summary) : null;
+          const unchanged = s.detailLoaded && !s.detailError && summaryKey !== null && summaryKey === s.selectedSummaryKey;
+          s.selectedSummaryKey = summaryKey;
+          if (!force && unchanged) {
+            if (s.selected?.state === 'pending') renderDetail(false);
+            if (s.tab === 'content') loadRecordSession(s.selected, true);
+          } else try {
             const record = await api(`/api/records/${encodeURIComponent(selectedId)}`);
             if (s.selectedId === selectedId && s.detailVersion === detailVersion) { s.selected = record; s.detailLoaded = true; s.detailLoading = false; s.detailError = ''; renderDetail(false); if (s.tab === 'content') loadRecordSession(record, true); }
           } catch (error) {
@@ -347,7 +439,7 @@
     }
   }
   function filterChanged() { s.offset = 0; s.requestVersion++; refresh(true); }
-  function resetFilters() { ['filter-query', 'filter-protocol', 'filter-container', 'filter-state'].forEach((id) => { $(id).value = ''; }); filterChanged(); }
+  function resetFilters() { ['filter-query', 'filter-source', 'filter-leg', 'filter-protocol', 'filter-container', 'filter-state'].forEach((id) => { if ($(id)) $(id).value = ''; }); filterChanged(); }
   function setView(view) {
     if (!titles[view]) return;
     s.view = view; s.offset = 0; s.requestVersion++;
@@ -357,7 +449,7 @@
     if (view === 'traffic' || view === 'pending') {
       $('traffic-title').replaceChildren(document.createTextNode(titles[view]), element('span', '.', 'heading-dot'));
       $('traffic-subtitle').textContent = view === 'pending' ? '匹配规则的请求已暂停。检查内容，编辑后放行，或直接丢弃。' : '查看每一次连接，按规则暂停，在放行前检查与修改。';
-      $('list-heading').textContent = view === 'pending' ? '等待处理' : '所有流量';
+      $('list-heading').textContent = view === 'pending' ? '等待处理' : isNewApi() ? '请求与回复' : '所有流量';
       $('filter-state').disabled = view === 'pending';
     }
     syncRecordDrawer();
@@ -371,8 +463,9 @@
     if (s.selectedId !== id) { s.tab = 'content'; recordSession = null; recordSessionBodies.clear(); }
     const previousRecord = s.selectedId === id ? s.selected : null;
     const previousLoaded = Boolean(previousRecord && s.detailLoaded);
+    s.selectedSummaryKey = JSON.stringify(s.records.find(record => record.id === id) || null);
     s.selectedId = id; s.detailLoaded = previousLoaded; s.detailLoading = true; s.detailError = ''; s.editing = false; s.draftOriginal = null;
-    s.hexPage = 0; s.hexSide = 'request'; bodyCache.clear(); hexCache.clear(); readableCache.clear();
+    s.hexPage = 0; s.hexSide = 'request'; bodyCache.clear(); hexCache.clear(); readableCache.clear(); bodyPanes.clear();
     $('edit-form').hidden = true; $('edit-button').textContent = '编辑内容';
     s.selected = previousLoaded ? previousRecord : s.records.find((record) => record.id === id) || previousRecord;
     const version = ++s.detailVersion;
@@ -430,18 +523,19 @@
     return bodyComplete(record, side) ? '完整保存' : '内容不完整，仅显示已保存字节';
   }
   function readableBodyKey(record, side) {
-    return `${bodyKey(record, side)}:${JSON.stringify(record[`${side}_headers`] || [])}:${record[`${side}_body_complete`]}`;
+    return `${bodyKey(record, side)}:${JSON.stringify(record[`${side}_headers`] || [])}:${record[`${side}_body_complete`]}:${s.bodyFormat[side] === 'prompt' ? 'prompt' : 'auto'}`;
   }
   function readableBodyEntry(record, side) {
-    const entry = readableCache.get(side);
+    const entry = readableCache.get(`${side}:${s.bodyFormat[side] === 'prompt' ? 'prompt' : 'auto'}`);
     return entry?.key === readableBodyKey(record, side) ? entry : null;
   }
   function loadReadableBody(record, side, retry = false) {
     const current = readableBodyEntry(record, side);
     if (current && !retry) return current;
     const entry = { key: readableBodyKey(record, side), state: 'loading' };
-    readableCache.set(side, entry);
-    api(`/api/records/${encodeURIComponent(record.id)}/readable/${side}`, { timeoutMs: 120000 })
+    const presentation = s.bodyFormat[side] === 'prompt' ? 'prompt' : 'auto';
+    readableCache.set(`${side}:${presentation}`, entry);
+    api(`/api/records/${encodeURIComponent(record.id)}/readable/${side}${presentation === 'prompt' ? '?presentation=prompt' : ''}`, { timeoutMs: 120000 })
       .then(async (meta) => { entry.meta = meta; entry.content = await api(meta.content_url, { responseType: 'text', timeoutMs: 120000 }); entry.state = 'ready'; })
       .catch((error) => { entry.error = error.message; entry.state = 'error'; })
       .finally(() => { if (s.selectedId === record.id && readableBodyEntry(s.selected, side) === entry) renderDetailBody(); });
@@ -449,34 +543,34 @@
   }
   function renderHttpBody(target, record, side, paired = false, paneTools = null) {
     const format = s.bodyFormat[side];
-    const entry = format === 'auto' ? loadReadableBody(record, side) : loadBody(record, side);
+    const entry = parsedHttpFormat(format) ? loadReadableBody(record, side) : loadBody(record, side);
     const caption = side === 'request' ? '请求正文' : '响应正文';
     const select = element('select'); select.id = paired ? `http-${side}-format` : 'http-body-format'; select.setAttribute('aria-label', `${caption}内容格式`);
-    select.append(new Option('自动解析', 'auto'), new Option('UTF-8 原文', 'text')); select.value = format;
+    select.append(new Option('Prompt / 回复', 'prompt'), new Option('自动解析', 'auto'), new Option(isNewApi() ? '原始 JSON / 事件' : 'UTF-8 原文', 'text')); select.value = format;
     select.addEventListener('change', () => { s.bodyFormat[side] = select.value; renderDetailBody(); });
     const controls = element('div', null, 'body-format-toolbar');
     if (paneTools) paneTools.toolbar.prepend(select);
     else { const label = element('label', '内容格式 '); label.append(select); controls.append(label); target.append(controls); }
-    if (format === 'auto' && entry?.state === 'ready' && entry.meta?.download_url) {
+    if (parsedHttpFormat(format) && entry?.state === 'ready' && entry.meta?.download_url) {
       const button = element('button', '下载解析全文 ↗', 'text-button'); button.id = paired ? `http-${side}-download-readable` : 'http-download-readable';
       button.addEventListener('click', () => download(entry.meta.download_url, `requestwatch-${record.id}-${side}-readable.txt`)); (paneTools?.downloads || controls).append(button);
     }
     const status = element('div', null, 'body-status');
     if (!entry || entry.state === 'loading') {
-      status.append(element('span', `正在读取${format === 'auto' ? '并解析' : ''}完整${caption}…`, 'detail-note')); target.append(status); return;
+      status.append(element('span', `正在读取${parsedHttpFormat(format) ? '并解析' : ''}完整${caption}…`, 'detail-note')); target.append(status); return;
     }
     if (entry.state === 'error') {
       status.append(element('span', `完整正文加载失败：${entry.error}`, 'detail-note body-error'));
       const retry = element('button', '重新读取', 'button secondary compact');
-      retry.addEventListener('click', () => { if (format === 'auto') loadReadableBody(record, side, true); else loadBody(record, side, true); renderDetailBody(); });
+      retry.addEventListener('click', () => { if (parsedHttpFormat(format)) loadReadableBody(record, side, true); else loadBody(record, side, true); renderDetailBody(); });
       status.append(retry); target.append(status); return;
     }
     const complete = bodyComplete(record, side);
-    const parsed = paired && format === 'auto' && entry.meta?.recognized && entry.meta?.complete !== false ? ` · ${readableLabel(entry.meta)}` : '';
+    const parsed = paired && parsedHttpFormat(format) && entry.meta?.recognized && entry.meta?.complete !== false ? ` · ${readableLabel(entry.meta)}` : '';
     status.append(element('span', `${complete ? '原始正文完整保存' : bodyStatusText(record, side)} · ${bytes(record[`${side}_body_size`] ?? new TextEncoder().encode(entry.text || entry.content || '').length)}${parsed}`, `detail-note${complete || bodyStreaming(record, side) ? '' : ' body-error'}`));
     if (!paired || !complete) target.append(status);
     if (bodyStreaming(record, side) && !record[`${side}_body_size`]) target.append(element('p', '已收到响应头，正在等待第一段响应正文。', 'detail-note'));
-    if (format === 'auto') appendReadable(target, entry, caption, '', paired);
+    if (parsedHttpFormat(format)) appendReadable(target, entry, caption, '', paired);
     else if (paired) { if (entry.text) target.append(element('pre', entry.text, 'code-block full-body')); else target.append(element('p', '无内容', 'detail-note')); }
     else addCode(target, caption, entry.text, 'full-body');
     if (paired && complete) { status.classList.add('body-footer'); target.append(status); }
@@ -557,6 +651,7 @@
     if (s.actionBusy) { toast('当前操作正在提交，请稍候。'); return; }
     if (s.editing && draftDirty() && !await confirmAction('关闭详情？', '当前草稿尚未提交，关闭后将丢弃此草稿。', '关闭详情')) return;
     const previousId = s.selectedId;
+    bodyPanes.clear(); bodyCache.clear(); readableCache.clear(); recordSessionBodies.clear();
     s.selected = null; s.selectedId = null; s.editing = false; s.draftOriginal = null; s.detailVersion++;
     renderDetail(); renderRecords();
     const row = [...$('records-body').children].find(row => row.dataset.id === previousId);
@@ -570,7 +665,7 @@
     $('detail-content').hidden = !record;
     syncRecordDrawer();
     if (!record) return;
-    if (record.source === 'http' && s.detailLoaded) { loadBody(record, 'request'); loadBody(record, 'response'); }
+    if (record.source === 'http' && s.detailLoaded && !isReadOnly()) loadBody(record, 'request');
     $('detail-inspector-label').textContent = record.source === 'http' ? 'HTTP INSPECTOR' : 'PACKET INSPECTOR';
     document.querySelector('[data-tab="request"]').textContent = record.source === 'http' ? '请求' : '单包载荷';
     document.querySelector('[data-tab="response"]').textContent = record.source === 'http' ? '响应' : record.response_body_text ? '重发返回' : '返回方向';
@@ -578,6 +673,9 @@
     $('detail-title').title = recordTitle(record);
     $('detail-protocol').replaceWith(Object.assign(protocolBadge(record), { id: 'detail-protocol' }));
     $('detail-state').replaceWith(Object.assign(recordStateBadge(record), { id: 'detail-state' }));
+    let leg = $('detail-leg');
+    if (!leg) { leg = element('span', '', 'badge'); leg.id = 'detail-leg'; $('detail-state').after(leg); }
+    leg.hidden = record.source !== 'http'; leg.textContent = record.source === 'http' ? captureLegLabel(record) : '';
     $('detail-id').textContent = `#${String(record.id).slice(0, 8)}`;
     $('detail-id').title = record.id;
     $('detail-url').textContent = record.url || `${endpoint(record.src_ip, record.src_port)} → ${endpoint(record.dst_ip, record.dst_port)}`;
@@ -607,16 +705,20 @@
     $('action-help').textContent = record.state === 'pending' ? '先处理当前拦截，再重发。编辑草稿会随放行提交；丢弃不会发送草稿。' : record.source === 'http' ? '重发将发送一条新的 HTTP 请求，可能再次执行服务端操作。' : record.protocol === 'UDP' ? '重发会向目标发送一个新的 UDP 数据报。' : '重发会建立新 TCP 连接并发送载荷，不保留原会话与协议握手。';
     if (reset || !s.editing) renderDetailBody();
   }
+  function detailContentKey(record) {
+    if (s.tab === 'overview') return [record.id, record.source, record.created_at, record.src_ip, record.src_port, record.dst_ip, record.dst_port, record.container_name, record.attribution, record.payload_size, record.request_body_size, record.response_body_size, record.status_code, record.duration_ms, record.matched_rule, record.rule_name, record.response_streaming, record.request_body_complete, record.response_body_complete];
+    return [record.id, record.source, record.protocol, record.state, record.method, record.url, record.status_code, record.request_headers, record.response_headers, bodyKey(record, 'request'), bodyKey(record, 'response'), record.request_body_complete, record.response_body_complete, record.response_streaming, record.request_body_binary, record.response_body_binary, record.body_binary, record.tcp_session_id, record.tcp_session_available, record.tcp_session_direction, record.tcp_session_error, record.tcp_session_unavailable_reason, record.payload_hex, record.payload_text, record.payload_size];
+  }
   function renderDetailBody() {
     const record = s.selected;
     if (!record) return;
     document.querySelectorAll('[data-tab]').forEach((node) => { const selected = node.dataset.tab === s.tab; node.classList.toggle('active', selected); node.setAttribute('aria-selected', String(selected)); });
     const target = $('detail-body');
     const loadState = (s.tab === 'content' ? ['request', 'response'] : ['request', 'response'].includes(s.tab) ? [s.tab] : []).map(side => [bodyEntry(record, side)?.state, bodyEntry(record, side)?.error, readableBodyEntry(record, side)?.state, readableBodyEntry(record, side)?.error, s.bodyFormat[side]]);
-    const inlineState = s.tab === 'content' && record.source !== 'http' ? [recordSession?.id, recordSession?.state, recordSession?.error, recordSession?.session, [...recordSessionBodies].map(([key, entry]) => [key, entry.key, entry.state, entry.error]), recordSessionFormats] : null;
-    const renderKey = JSON.stringify([s.tab, record, s.detailLoaded, s.detailLoading, s.detailError, loadState, inlineState, s.hexSide, s.hexPage, s.tab === 'hex' ? [...hexCache].map(([key, value]) => [key, value.state, value.error]) : null]);
-    if (target.dataset.renderKey === renderKey) return;
-    target.dataset.renderKey = renderKey;
+    const inlineState = s.tab === 'content' && record.source !== 'http' ? [recordSession?.id, recordSession?.state, recordSession?.error, recordSession?.session ? [sessionKey(recordSession.session, 'client', recordSessionFormats.client), sessionKey(recordSession.session, 'server', recordSessionFormats.server)] : null, [...recordSessionBodies].map(([key, entry]) => [key, entry.key, entry.state, entry.error]), recordSessionFormats] : null;
+    const renderKey = JSON.stringify([s.tab, detailContentKey(record), s.detailLoaded, s.detailLoading, s.detailError, loadState, inlineState, s.hexSide, s.hexPage, s.tab === 'hex' ? [...hexCache].map(([key, value]) => [key, value.state, value.error]) : null]);
+    if (detailRenderKeys.get(target) === renderKey) return;
+    detailRenderKeys.set(target, renderKey);
     rememberReading(target);
     target.replaceChildren();
     if (!s.detailLoaded && s.tab !== 'overview') {
@@ -661,7 +763,7 @@
       renderHex(target, record);
     }
     restoreReading(target, `${record.id}:${s.tab}:${s.bodyFormat[s.tab] || ''}:${s.hexSide}:${s.hexPage}`);
-    target.dataset.readingReady = String(!['request', 'response'].includes(s.tab) || record.source !== 'http' || (s.bodyFormat[s.tab] === 'auto' ? readableBodyEntry(record, s.tab)?.state : bodyEntry(record, s.tab)?.state) === 'ready');
+    target.dataset.readingReady = String(!['request', 'response'].includes(s.tab) || record.source !== 'http' || (parsedHttpFormat(s.bodyFormat[s.tab]) ? readableBodyEntry(record, s.tab)?.state : bodyEntry(record, s.tab)?.state) === 'ready');
   }
   function openEditor() {
     if (isReadOnly()) { toast('当前为只读观察模式，不能修改流量。'); return; }
@@ -798,8 +900,13 @@
       }
       if (!match) { search.dataset.match = '-1'; search.dataset.block = '-1'; toast('此处后续内容没有匹配；再次查找将从开头开始。'); return; }
       search.dataset.query = query; search.dataset.match = String(match.at); search.dataset.block = String(match.index);
-      const textNode = match.block.firstChild; if (!textNode || textNode.nodeType !== Node.TEXT_NODE) return;
-      const range = document.createRange(); range.setStart(textNode, match.at); range.setEnd(textNode, match.at + query.length);
+      const locate = offset => {
+        const walker = document.createTreeWalker(match.block, NodeFilter.SHOW_TEXT); let node;
+        while ((node = walker.nextNode())) { if (offset <= node.length) return [node, offset]; offset -= node.length; }
+        return null;
+      };
+      const start = locate(match.at); const end = locate(match.at + query.length); if (!start || !end) return;
+      const range = document.createRange(); range.setStart(...start); range.setEnd(...end);
       const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(range);
       const rect = range.getBoundingClientRect(); const box = match.block.getBoundingClientRect(); match.block.scrollTop += rect.top - box.top - 30;
     };
@@ -809,8 +916,13 @@
     const workspace = element('div', null, 'body-workspace'); target.append(workspace);
     if (record.source === 'http') {
       for (const side of ['request', 'response']) {
-        const caption = side === 'request' ? '请求体' : '响应体';
+        const active = parsedHttpFormat(s.bodyFormat[side]) ? readableBodyEntry(record, side) : bodyEntry(record, side);
+        const paneKey = JSON.stringify([record.id, side, readableBodyKey(record, side), s.bodyFormat[side], active?.state, active?.error, record.state, record.method, record.url, record.status_code, bodyStreaming(record, side), record[`${side}_body_binary`], record.body_binary]);
+        const cached = bodyPanes.get(side);
+        if (cached?.key === paneKey) { workspace.append(cached.pane); continue; }
+        const caption = s.bodyFormat[side] === 'prompt' ? (side === 'request' ? '发送的 Prompt' : '收到的回复') : side === 'request' ? '请求体' : '响应体';
         const { pane, toolbar, content } = makeBodyPane(workspace, side, caption, side === 'request' ? `${record.method || 'GET'} ${record.url || ''}` : record.status_code ? `HTTP ${record.status_code}${bodyStreaming(record, side) ? ' · 持续接收中' : ''}` : '等待服务器响应');
+        bodyPanes.set(side, { key: paneKey, pane });
         if (side === 'response' && !bodyPresent(record, side)) {
           content.append(element('p', record.state === 'pending' ? '请求尚未放行，暂无响应正文。' : record.state === 'dropped' ? '请求已丢弃，没有响应正文。' : '正在等待响应正文。', 'body-empty-state'));
           continue;
@@ -852,12 +964,14 @@
     const id = record.tcp_session_id;
     if (recordSession?.id !== id) { recordSession = { id, state: 'idle', session: null, error: '' }; recordSessionBodies.clear(); }
     const entry = recordSession;
-    if (entry.state === 'loading' || (!refresh && entry.state !== 'idle')) return entry;
-    entry.state = 'loading'; entry.error = '';
+    if (entry.loading || (!refresh && entry.state !== 'idle')) return entry;
+    entry.loading = true;
+    if (!entry.session) entry.state = 'loading';
+    entry.error = '';
     api(`/api/sessions/${encodeURIComponent(id)}`)
       .then(session => { entry.session = session; entry.state = 'ready'; })
       .catch(error => { entry.error = error.message; entry.state = 'error'; })
-      .finally(() => { if (recordSession === entry && s.selected?.tcp_session_id === id && s.tab === 'content') renderDetailBody(); });
+      .finally(() => { entry.loading = false; if (recordSession === entry && s.selected?.tcp_session_id === id && s.tab === 'content') renderDetailBody(); });
     return entry;
   }
   function loadInlineTcpBody(session, side, format) {
@@ -876,10 +990,14 @@
   function renderInlineTcpPane(workspace, record, session, side) {
     const direction = session.directions?.[side] || {};
     const format = recordSessionFormats[side]; const entry = loadInlineTcpBody(session, side, format);
+    const paneKey = JSON.stringify([record.id, record.tcp_session_direction, sessionKey(session, side, format), entry.state, entry.error, session.client_ip, session.client_port, session.server_ip, session.server_port]);
+    const cached = bodyPanes.get(`tcp:${side}`);
+    if (cached?.key === paneKey) { workspace.append(cached.pane); return; }
     const caption = sessionDirectionLabel(session, side);
     const from = side === 'client' ? endpoint(session.client_ip, session.client_port) : endpoint(session.server_ip, session.server_port);
     const to = side === 'client' ? endpoint(session.server_ip, session.server_port) : endpoint(session.client_ip, session.client_port);
     const { pane, toolbar, content } = makeBodyPane(workspace, side, caption, `${from} → ${to} · ${bytes(direction.byte_count)} 已保存`);
+    bodyPanes.set(`tcp:${side}`, { key: paneKey, pane });
     pane.classList.toggle('packet-current-direction', record.tcp_session_direction === side);
     const select = element('select'); select.id = `inline-tcp-${side}-format`; select.setAttribute('aria-label', `${caption}内容格式`);
     select.append(new Option('自动解析', 'auto'), new Option('UTF-8 原文', 'text'), new Option('Latin-1 原文', 'latin1')); select.value = format;
@@ -1073,7 +1191,9 @@
     settingsState.data = data; settingsState.dirty = false; settingsState.restartDone = false;
     const values = data.saved || {};
     document.querySelectorAll('[data-setting]').forEach((input) => {
-      const value = values[input.dataset.setting];
+      const newFields = { inspection_profile: 'network', newapi_upstream: '', newapi_reverse_port: 8081 };
+      const value = values[input.dataset.setting] ?? newFields[input.dataset.setting];
+      if (input.dataset.setting in newFields) input.disabled = !(input.dataset.setting in values);
       if (input.type === 'checkbox') input.checked = Boolean(value);
       else input.value = Array.isArray(value) ? value.join(',') : value ?? '';
     });
@@ -1086,6 +1206,7 @@
     $('settings-rollback').hidden = !data.restart_rollback;
     $('settings-demo').hidden = !data.demo; $('settings-loading').hidden = true; $('settings-form').hidden = false;
     if (!data.pending?.includes('token')) settingsState.pendingToken = '';
+    updateNewApiContainers();
     settingsControls();
   }
   async function loadSettings(force = false) {
@@ -1097,6 +1218,7 @@
     const values = {};
     document.querySelectorAll('[data-setting]').forEach((input) => {
       const name = input.dataset.setting;
+      if (input.disabled) return;
       if (input.type === 'checkbox') values[name] = input.checked;
       else if (input.type === 'number') { const value = Number(input.value); if (!Number.isFinite(value) || !input.value.trim()) throw new Error(`${settingNames[name]}需要填写有效数字。`); values[name] = value; }
       else if (name === 'protected_ports') {
@@ -1105,6 +1227,12 @@
         values[name] = [...new Set(parts.map(Number))];
       } else values[name] = input.value.trim();
     });
+    if (values.inspection_profile !== undefined && !['newapi', 'network'].includes(values.inspection_profile)) throw new Error('采集用途请选择 NewAPI 或全部网络。');
+    if (values.newapi_reverse_port !== undefined && (!Number.isInteger(values.newapi_reverse_port) || values.newapi_reverse_port < 1 || values.newapi_reverse_port > 65535)) throw new Error('NewAPI 接入端口必须是 1–65535 的整数。');
+    if (values.newapi_upstream) {
+      let upstream; try { upstream = new URL(values.newapi_upstream); } catch (_) { throw new Error('NewAPI 实际地址需要完整的 http:// 或 https:// 地址。'); }
+      if (!['http:', 'https:'].includes(upstream.protocol) || !upstream.hostname) throw new Error('NewAPI 实际地址需要完整的 http:// 或 https:// 地址。');
+    }
     if ($('setting-token').value) values.token = $('setting-token').value;
     if ($('setting-clear-proxy-auth').checked) values.proxy_auth = '';
     else if ($('setting-proxy-auth').value) values.proxy_auth = $('setting-proxy-auth').value;
@@ -1249,6 +1377,7 @@
   document.querySelectorAll('[data-tab]').forEach((button) => button.addEventListener('click', () => { s.tab = button.dataset.tab; renderDetail(); }));
 
 
+  $('newapi-use-container')?.addEventListener('click', useNewApiContainer);
   $('settings-form').addEventListener('submit', saveSettings);
   $('settings-form').addEventListener('input', () => { settingsState.dirty = true; $('setting-proxy-auth').disabled = $('setting-clear-proxy-auth').checked; settingsControls(); });
   $('settings-reload').addEventListener('click', async () => { if (settingsState.dirty && !await confirmAction('重新读取设置？', '未保存的设置修改会被已保存配置替换。', '重新读取')) return; try { await loadSettings(true); } catch (_) { /* Inline settings error already explains the failure. */ } });
@@ -1270,7 +1399,19 @@
 
   $('filter-form').addEventListener('submit', (event) => { event.preventDefault(); clearTimeout(searchTimer); filterChanged(); });
   $('filter-query').addEventListener('input', () => { clearTimeout(searchTimer); searchTimer = setTimeout(filterChanged, 350); });
-  ['filter-protocol', 'filter-container', 'filter-state'].forEach((id) => $(id).addEventListener('change', filterChanged));
+  ['filter-protocol', 'filter-container', 'filter-state', 'filter-source', 'filter-leg'].forEach((id) => $(id)?.addEventListener('change', () => {
+    if (id === 'filter-protocol' && ['TCP', 'UDP'].includes($('filter-protocol').value)) {
+      if ($('filter-source')) $('filter-source').value = '';
+      if ($('filter-leg')) $('filter-leg').value = '';
+    } else if (id === 'filter-leg' && $('filter-leg').value) {
+      if ($('filter-source')) $('filter-source').value = 'http';
+      if (['TCP', 'UDP'].includes($('filter-protocol').value)) $('filter-protocol').value = '';
+    } else if (id === 'filter-source') {
+      if (!$('filter-source').value && $('filter-leg')) $('filter-leg').value = '';
+      if ($('filter-source').value === 'http' && ['TCP', 'UDP'].includes($('filter-protocol').value)) $('filter-protocol').value = '';
+    }
+    filterChanged();
+  }));
   $('reset-filters').addEventListener('click', resetFilters);
   $('refresh-button').addEventListener('click', () => refresh(true));
   $('poll-button').addEventListener('click', () => { s.polling = !s.polling; $('poll-button').setAttribute('aria-pressed', String(s.polling)); $('poll-button').className = `button ${s.polling ? 'primary' : 'secondary'}`; $('poll-button').replaceChildren(...(s.polling ? [element('span', null, 'live-dot'), element('span', '实时刷新')] : [element('span', '继续刷新')])); renderCaptureSummary(); if (s.polling) refresh(true); toast(s.polling ? '已恢复每 2 秒刷新' : '已暂停页面刷新，服务端仍会继续采集'); });

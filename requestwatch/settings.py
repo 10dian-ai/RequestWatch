@@ -14,7 +14,8 @@ import re
 import stat
 import tempfile
 import threading
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
@@ -55,6 +56,33 @@ def _listen_host(value: str) -> str:
     return value
 
 
+def reverse_proxy_enabled(values: Mapping) -> bool:
+    return (values.get("proxy_enabled", True) and values.get("inspection_profile", "newapi") == "newapi"
+            and bool(values.get("newapi_upstream", "")))
+
+
+def _check_listener_conflicts(values: Mapping) -> None:
+    web_port, forward_port = values.get("port", 7030), values.get("proxy_port", 8080)
+    if web_port == forward_port:
+        raise ValueError("Web 端口和 HTTP 代理端口不能相同")
+    if not reverse_proxy_enabled(values):
+        return
+    reverse_port = values.get("newapi_reverse_port", 8081)
+    if reverse_port in {web_port, forward_port}:
+        raise ValueError("已启用的 New API 入站代理端口不能与 Web 或上游代理端口相同")
+    upstream = urlsplit(values["newapi_upstream"])
+    upstream_host = (upstream.hostname or "").lower().rstrip(".")
+    upstream_port = upstream.port or (443 if upstream.scheme == "https" else 80)
+    local_names = {"localhost", "127.0.0.1", "::1", "0.0.0.0", "::", "host.docker.internal"}
+    local_names.update(str(values.get(name, "127.0.0.1")).lower().rstrip(".") for name in ("host", "proxy_host"))
+    try:
+        loopback = ipaddress.ip_address(upstream_host).is_loopback
+    except ValueError:
+        loopback = False
+    if upstream_port in {web_port, forward_port, reverse_port} and (loopback or upstream_host in local_names):
+        raise ValueError("New API 源站不能指向 RequestWatch 自身的 Web、上游代理或入站代理监听端口")
+
+
 class SettingsInput(BaseModel):
     """Partial settings update. Omitted fields are unchanged; null is rejected."""
 
@@ -63,6 +91,9 @@ class SettingsInput(BaseModel):
     host: str | None = Field(default=None, min_length=1, max_length=253)
     port: Port | None = None
     interfaces: str | list[str] | None = Field(default=None, max_length=2048)
+    inspection_profile: Literal["newapi", "network"] | None = None
+    newapi_upstream: str | None = Field(default=None, max_length=2048)
+    newapi_reverse_port: Port | None = None
     capture_enabled: bool | None = None
     passive_only: bool | None = None
     queue_num: Port | None = None
@@ -89,6 +120,27 @@ class SettingsInput(BaseModel):
     @classmethod
     def validate_host(cls, value: str):
         return _listen_host(value)
+
+    @field_validator("newapi_upstream")
+    @classmethod
+    def validate_newapi_upstream(cls, value: str):
+        if not value:
+            return ""
+        message = "New API 地址仅支持 http/https 源站地址，不能包含账号密码、路径、查询参数或片段"
+        try:
+            if any(char.isspace() for char in value) or _controls(value) or "\\" in value or "?" in value or "#" in value:
+                raise ValueError(message)
+            parsed = urlsplit(value)
+            if (parsed.scheme not in {"http", "https"} or not parsed.hostname
+                    or parsed.username is not None or parsed.password is not None
+                    or parsed.path not in {"", "/"}):
+                raise ValueError(message)
+            _listen_host(parsed.hostname)
+            if parsed.port is not None and parsed.port < 1:
+                raise ValueError(message)
+        except ValueError:
+            raise ValueError(message) from None
+        return value.rstrip("/")
 
     @field_validator("interfaces")
     @classmethod
@@ -146,8 +198,16 @@ class SettingsInput(BaseModel):
 
     @model_validator(mode="after")
     def distinct_ports(self):
+        # Partial updates are merged with running settings in validate_settings.
+        # Only compare explicitly present ports here; disabled reverse settings
+        # must not claim an unused port in upgraded installations.
+        values = self.model_dump(exclude_unset=True)
         if self.port is not None and self.proxy_port is not None and self.port == self.proxy_port:
             raise ValueError("Web 端口和 HTTP 代理端口不能相同")
+        if reverse_proxy_enabled(values):
+            reverse_port = self.newapi_reverse_port if self.newapi_reverse_port is not None else 8081
+            if reverse_port in {self.port, self.proxy_port}:
+                raise ValueError("已启用的 New API 入站代理端口不能与 Web 或上游代理端口相同")
         return self
 
 
@@ -181,12 +241,15 @@ def validate_settings(values: Mapping | SettingsInput, base: Mapping | None = No
     defaults). Returned values are the normalized update, never the base mapping.
     """
     result = _validated_updates(values)
-    effective = {"port": 7030, "proxy_port": 8080}
+    effective = {"port": 7030, "proxy_port": 8080, "newapi_reverse_port": 8081,
+                 "inspection_profile": "newapi", "newapi_upstream": "", "proxy_enabled": True}
     if base is not None:
         effective.update({key: value for key, value in base.items() if key in SETTING_NAMES})
     effective.update(result)
-    if effective["port"] == effective["proxy_port"]:
-        raise SettingsError("Web 端口和 HTTP 代理端口不能相同")
+    try:
+        _check_listener_conflicts(effective)
+    except ValueError as exc:
+        raise SettingsError(str(exc)) from exc
     return result
 
 

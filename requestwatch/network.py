@@ -249,6 +249,8 @@ class NetworkEngine:
         self._retry_at = 0.0
 
     def start(self):
+        if getattr(self.config, "inspection_profile", "network") == "newapi":
+            return  # HTTP listeners capture both New API legs without host sniffing.
         if not self.config.capture_enabled or (self._thread and self._thread.is_alive()):
             return
         if self._platform != "linux":
@@ -321,13 +323,18 @@ class NetworkEngine:
             if exception:
                 self._capture_error = str(exception)
                 self._capture_running = False
-        return {"enabled": bool(self.config.capture_enabled), "capture_running": self._capture_running,
+        newapi = getattr(self.config, "inspection_profile", "network") == "newapi"
+        return {"enabled": bool(self.config.capture_enabled) and not newapi,
+                "configured_enabled": bool(self.config.capture_enabled),
+                "inspection_profile": getattr(self.config, "inspection_profile", "network"),
+                "message": "New API 专注模式：使用 HTTP 代理捕获完整请求和响应，全机抓包已停用。" if newapi else "",
+                "capture_running": self._capture_running,
                 "interception_running": self._queue_active,
                 "pending_packets": sum(len(p.packets) for p in list(self._pending.values())),
                 "capture_error": self._capture_error, "interception_error": self._queue_error,
                 "interfaces": self.config.interfaces, "active_interfaces": list(self._capture_interfaces),
                 "protected_ports": list(self.config.protected_ports), "queue_num": self.config.queue_num,
-                "capture_mode": "passive" if getattr(self.config, "passive_only", False) else "intercept",
+                "capture_mode": "newapi" if newapi else ("passive" if getattr(self.config, "passive_only", False) else "intercept"),
                 "passive_only": bool(getattr(self.config, "passive_only", False)),
                 "passive_dropped": self._passive_dropped,
                 "observation_dropped": self._passive_dropped,
@@ -388,7 +395,7 @@ class NetworkEngine:
             self._command(binary, "-I", parent, "1", "-m", "comment", "--comment", self._comment, "-j", self._chain)
 
     def _enable_queue(self):
-        if getattr(self.config, "passive_only", False):
+        if getattr(self.config, "passive_only", False) or getattr(self.config, "inspection_profile", "network") == "newapi":
             return
         try:
             factory = self._queue_factory
@@ -427,7 +434,7 @@ class NetworkEngine:
             self._queue_error = "; ".join(errors)
 
     def _rules_need_queue(self):
-        if getattr(self.config, "passive_only", False):
+        if getattr(self.config, "passive_only", False) or getattr(self.config, "inspection_profile", "network") == "newapi":
             return False
         return any(rule.get("enabled", True) and rule.get("source", "any") in ("any", "packet")
                    and str(rule.get("protocol", "any")).upper() in ("ANY", "TCP", "UDP")
@@ -579,7 +586,7 @@ class NetworkEngine:
         return processed
 
     def _on_queued(self, packet):
-        if getattr(self.config, "passive_only", False):
+        if getattr(self.config, "passive_only", False) or getattr(self.config, "inspection_profile", "network") == "newapi":
             packet.accept()
             return
         retained = False
